@@ -11,7 +11,7 @@ from telegram.ext import (
 # Bot configuration
 TOKEN = "8272958952:AAEixe1Zn3Ba8cZeUMSw8WFxxrVFuk9QOpI"
 WEBHOOK_PATH = "/webhook/hadscash-secret"
-WEBHOOK_URL = f"https://hadscash.onrender.com{WEBHOOK_PATH}"
+WEBHOOK_URL = f""https://hadscash.onrender.com/webhook/hadscash-secret"{WEBHOOK_PATH}"
 ADMIN_ID = 5542927340
 CHANNEL_ID = "@hadscash"
 TRON_ADDRESS = "TJ4xrwKJzKjk6FgKfuuqwah3Az5Ur22kJb"

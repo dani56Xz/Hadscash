@@ -10,8 +10,8 @@ from telegram.ext import (
 
 # Bot configuration
 TOKEN = "8272958952:AAEixe1Zn3Ba8cZeUMSw8WFxxrVFuk9QOpI"
-WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"https://api.telegram.org/bot8272958952:AAEixe1Zn3Ba8cZeUMSw8WFxxrVFuk9QOpI/setWebhook?url=https://hadscash.onrender.com/webhook/hadscash-secret&max_connections=40{WEBHOOK_PATH}"
+WEBHOOK_PATH = "/webhook/hadscash-secret"
+WEBHOOK_URL = f"https://hadscash.onrender.com{WEBHOOK_PATH}"
 ADMIN_ID = 5542927340
 CHANNEL_ID = "@hadscash"
 TRON_ADDRESS = "TJ4xrwKJzKjk6FgKfuuqwah3Az5Ur22kJb"
@@ -22,8 +22,9 @@ REFERRAL_BONUS = 5000  # 5,000 Toman
 # Logging setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.DEBUG  # Changed to DEBUG for more detailed logs
 )
+logger = logging.getLogger(__name__)
 
 # FastAPI app
 app = FastAPI()
@@ -57,8 +58,10 @@ def get_balance_menu():
 async def check_membership(bot, user_id):
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        logger.debug(f"Membership check for user {user_id}: {member.status}")
         return member.status in ["member", "administrator", "creator"]
-    except:
+    except Exception as e:
+        logger.error(f"Error checking membership for user {user_id}: {e}")
         return False
 
 # Fetch TRON price in USD
@@ -66,6 +69,7 @@ async def get_tron_price():
     async with aiohttp.ClientSession() as session:
         async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd") as resp:
             data = await resp.json()
+            logger.debug(f"TRON price fetched: {data}")
             return data["tron"]["usd"]
 
 # Convert Toman to TRON with fee consideration (assuming 1 TRX fee)
@@ -80,6 +84,7 @@ async def toman_to_tron(toman):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
+    logger.debug(f"Received /start from user {user_id} ({username})")
     
     # Initialize user data if new
     if user_id not in users:
@@ -91,6 +96,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "referrals": 0,
             "total_earned": 0
         }
+        logger.debug(f"New user initialized: {user_id}")
     
     # Check for referral
     args = context.args
@@ -104,6 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=referrer_id,
                     text=f"🎉 یک نفر با لینک دعوت شما عضو شد! {REFERRAL_BONUS:,} تومان به موجودی شما اضافه شد."
                 )
+                logger.debug(f"Referral bonus added for {referrer_id} by {user_id}")
 
     # Check channel membership
     if not await check_membership(context.bot, user_id):
@@ -112,6 +119,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "لطفاً ابتدا در کانال @hadscash عضو شوید و سپس دوباره /start را بزنید!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        logger.debug(f"User {user_id} not in channel, prompted to join")
         return
 
     # Notify admin of new member
@@ -119,24 +127,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=ADMIN_ID,
         text=f"🎉 کاربر جدید:\nID: {user_id}\nUsername: {username}"
     )
+    logger.debug(f"Admin notified of new user {user_id}")
 
     # Welcome message
     await update.message.reply_text(
         "🎮 به ربات حدس کَش خوش آمدید!\nبا حدس عدد درست (۱ تا ۱۰۰۰) می‌توانید درآمد کسب کنید!",
         reply_markup=get_main_menu()
     )
+    logger.debug(f"Welcome message sent to user {user_id}")
 
 # Admin command to set winning number
 async def set_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        logger.debug(f"Unauthorized set_number attempt by {user_id}")
         return
     if not context.args:
         await update.message.reply_text("لطفاً عدد را وارد کنید: /set_number <عدد>")
+        logger.debug(f"No number provided for set_number by {user_id}")
         return
     global WINNING_NUMBER
     WINNING_NUMBER = int(context.args[0])
     await update.message.reply_text(f"عدد برنده به {WINNING_NUMBER} تغییر کرد.")
+    logger.debug(f"Winning number set to {WINNING_NUMBER} by admin {user_id}")
 
 # Handle button clicks
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,6 +157,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     data = query.data
+    logger.debug(f"Button clicked by {user_id}: {data}")
 
     if data == "main_menu":
         await query.message.edit_text("منوی اصلی:", reply_markup=get_main_menu())
@@ -156,17 +170,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (now - last_guess).days >= 7:
             users[user_id]["guesses_left"] = 1
             users[user_id]["last_free_guess"] = now
+            logger.debug(f"Free guess reset for {user_id}")
         if user.get("guesses_left", 0) == 0 and user.get("balance", 0) < MIN_BALANCE_FOR_GUESS:
             await query.message.edit_text(
                 "❌ شانس شما تمام شده است! برای ادامه:\n1️⃣ دوستان خود را دعوت کنید\n2️⃣ موجودی خود را افزایش دهید\n3️⃣ تا هفته بعد صبر کنید",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت به منو", callback_data="main_menu")]])
             )
+            logger.debug(f"User {user_id} has no guesses or balance")
             return
         await query.message.edit_text(
             "🎲 یک عدد بین ۱ تا ۱۰۰۰ حدس بزنید:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت به منو", callback_data="main_menu")]])
         )
         context.user_data["state"] = "guessing"
+        logger.debug(f"User {user_id} started guessing")
         return
 
     if data == "profile":
@@ -175,6 +192,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 پروفایل شما:\nID: {user_id}\nUsername: {user.get('username', 'Unknown')}\nموجودی: {user.get('balance', 0):,} تومان\nتعداد دعوت‌ها: {user.get('referrals', 0)}\nکل درآمد: {user.get('total_earned', 0):,} تومان",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت به منو", callback_data="main_menu")]])
         )
+        logger.debug(f"Profile shown for {user_id}")
         return
 
     if data == "invite":
@@ -183,10 +201,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📩 دوستان خود را دعوت کنید و به ازای هر نفر {REFERRAL_BONUS:,} تومان دریافت کنید!\nلینک دعوت شما:\n{referral_link}\n\n📢 ربات حدس کَش: با حدس عدد درست درآمد کسب کنید!",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت به منو", callback_data="main_menu")]])
         )
+        logger.debug(f"Invite link sent to {user_id}")
         return
 
     if data == "balance":
         await query.message.edit_text("💰 مدیریت موجودی:", reply_markup=get_balance_menu())
+        logger.debug(f"Balance menu shown for {user_id}")
         return
 
     if data == "show_balance":
@@ -195,6 +215,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💸 موجودی شما: {balance:,} تومان",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت به منو", callback_data="main_menu")]])
         )
+        logger.debug(f"Balance shown for {user_id}: {balance}")
         return
 
     if data == "increase_balance":
@@ -203,24 +224,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت به منو", callback_data="main_menu")]])
         )
         context.user_data["state"] = "increase_balance"
+        logger.debug(f"User {user_id} prompted to increase balance")
         return
 
 # Handle user guesses
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = context.user_data.get("state")
+    logger.debug(f"Message received from {user_id} in state {state}: {update.message.text}")
 
     if state == "guessing":
         try:
             guess = int(update.message.text)
             if not 1 <= guess <= 1000:
                 await update.message.reply_text("لطفاً یک عدد بین ۱ تا ۱۰۰۰ وارد کنید!")
+                logger.debug(f"Invalid guess by {user_id}: {guess}")
                 return
             user = users[user_id]
             if user["guesses_left"] > 0:
                 user["guesses_left"] -= 1
+                logger.debug(f"Used free guess for {user_id}")
             else:
                 user["balance"] -= MIN_BALANCE_FOR_GUESS
+                logger.debug(f"Deducted {MIN_BALANCE_FOR_GUESS} from {user_id}'s balance")
 
             if guess == WINNING_NUMBER:
                 prize = 100000  # Example prize, adjust as needed
@@ -234,14 +260,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=ADMIN_ID,
                     text=f"🏆 برنده جدید!\nID: {user_id}\nUsername: {user.get('username')}\nجایزه: {prize:,} تومان\nتعداد دعوت‌ها: {user.get('referrals', 0)}\nکل درآمد: {user.get('total_earned', 0):,}"
                 )
+                logger.debug(f"User {user_id} won {prize} with guess {guess}")
             else:
                 await update.message.reply_text(
                     "❌ اشتباه بود! شانس شما تمام شده است. برای ادامه:\n1️⃣ دوستان خود را دعوت کنید\n2️⃣ موجودی خود را افزایش دهید\n3️⃣ تا هفته بعد صبر کنید",
                     reply_markup=get_main_menu()
                 )
+                logger.debug(f"Wrong guess by {user_id}: {guess}")
             context.user_data["state"] = None
         except ValueError:
             await update.message.reply_text("لطفاً یک عدد معتبر وارد کنید!")
+            logger.debug(f"Non-numeric guess by {user_id}: {update.message.text}")
         return
 
     if state == "increase_balance":
@@ -249,6 +278,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = int(update.message.text)
             if amount <= 0:
                 await update.message.reply_text("لطفاً مبلغ معتبر وارد کنید!")
+                logger.debug(f"Invalid balance amount by {user_id}: {update.message.text}")
                 return
             tron_amount = await toman_to_tron(amount)
             await update.message.reply_text(
@@ -259,31 +289,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=ADMIN_ID,
                 text=f"📥 درخواست افزایش موجودی:\nID: {user_id}\nUsername: {users[user_id].get('username')}\nمبلغ: {amount:,} تومان\nمقدار TRX: {tron_amount:.2f}"
             )
+            logger.debug(f"Deposit request by {user_id}: {amount} Toman ({tron_amount} TRX)")
             context.user_data["state"] = None
         except ValueError:
             await update.message.reply_text("لطفاً یک عدد معتبر وارد کنید!")
+            logger.debug(f"Non-numeric balance input by {user_id}: {update.message.text}")
         return
 
 # Webhook handler
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.update_queue.put(update)
-    return {"ok": True}
+    try:
+        data = await request.json()
+        logger.debug(f"Webhook received: {data}")
+        update = Update.de_json(data, application.bot)
+        if update:
+            await application.update_queue.put(update)
+            logger.debug("Update added to queue")
+        else:
+            logger.warning("Invalid update received")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return {"ok": False}
 
 # Startup and shutdown
 @app.on_event("startup")
 async def on_startup():
-    await application.bot.set_webhook(url=WEBHOOK_URL)
-    print("✅ Webhook set:", WEBHOOK_URL)
-    await application.initialize()
-    await application.start()
+    try:
+        await application.bot.set_webhook(url=WEBHOOK_URL, max_connections=40)
+        logger.info(f"Webhook set: {WEBHOOK_URL}")
+        await application.initialize()
+        await application.start()
+        logger.info("Application started")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await application.stop()
-    await application.shutdown()
+    try:
+        await application.stop()
+        await application.shutdown()
+        logger.info("Application stopped")
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}")
 
 # Register handlers
 application.add_handler(CommandHandler("start", start))

@@ -36,7 +36,7 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, unique=True)
+    user_id = Column(BigInteger, unique=True)  # Changed to BigInteger for Telegram user IDs
     username = Column(String)
     balance = Column(Float, default=0)
     guesses_left = Column(Integer, default=1)
@@ -45,7 +45,8 @@ class User(Base):
     total_earned = Column(Float, default=0)
 
 engine = create_engine(DATABASE_URL)
-Base.metadata.create_all(engine)
+Base.metadata.drop_all(engine)  # Drop existing table to recreate with correct schema
+Base.metadata.create_all(engine)  # Recreate table with updated schema
 Session = sessionmaker(bind=engine)
 
 # FastAPI app
@@ -84,11 +85,15 @@ async def check_membership(bot, user_id):
 
 # Fetch TRON price in USD
 async def get_tron_price():
-    async with aiohttp.ClientSession() as session:
-        async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd") as resp:
-            data = await resp.json()
-            logger.debug(f"💹 قیمت TRON دریافت شد: {data}")
-            return data["tron"]["usd"]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=usd") as resp:
+                data = await resp.json()
+                logger.debug(f"💹 قیمت TRON دریافت شد: {data}")
+                return data["tron"]["usd"]
+    except Exception as e:
+        logger.error(f"❌ خطا در دریافت قیمت TRON: {e}")
+        return 0.1  # Fallback price in case of failure
 
 # Convert Toman to TRON with fee consideration (assuming 1 TRX fee)
 async def toman_to_tron(toman):
@@ -106,63 +111,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Initialize user data if new
     session = Session()
-    user = session.query(User).filter_by(user_id=user_id).first()
-    if not user:
-        user = User(
-            user_id=user_id,
-            username=username,
-            balance=0,
-            guesses_left=1,
-            last_free_guess=datetime.now(),
-            referrals=0,
-            total_earned=0
-        )
-        session.add(user)
-        session.commit()
-        logger.debug(f"🌟 کاربر جدید ایجاد شد: {user_id}")
-    
-    # Check for referral
-    args = context.args
-    if args and args[0].isdigit():
-        referrer_id = int(args[0])
-        if referrer_id != user_id:
-            referrer = session.query(User).filter_by(user_id=referrer_id).first()
-            if referrer and await check_membership(context.bot, user_id):
-                referrer.balance += REFERRAL_BONUS
-                referrer.referrals += 1
-                session.commit()
-                await context.bot.send_message(
-                    chat_id=referrer_id,
-                    text=f"🎉 یه نفر با لینک دعوتت عضو شد! {REFERRAL_BONUS:,} 💸 به موجودیت اضافه شد!"
-                )
-                logger.debug(f"🎁 پاداش دعوت برای {referrer_id} توسط {user_id}")
+    try:
+        user = session.query(User).filter_by(user_id=user_id).first()
+        if not user:
+            user = User(
+                user_id=user_id,
+                username=username,
+                balance=0,
+                guesses_left=1,
+                last_free_guess=datetime.now(),
+                referrals=0,
+                total_earned=0
+            )
+            session.add(user)
+            session.commit()
+            logger.debug(f"🌟 کاربر جدید ایجاد شد: {user_id}")
+        
+        # Check for referral
+        args = context.args
+        if args and args[0].isdigit():
+            referrer_id = int(args[0])
+            if referrer_id != user_id:
+                referrer = session.query(User).filter_by(user_id=referrer_id).first()
+                if referrer and await check_membership(context.bot, user_id):
+                    referrer.balance += REFERRAL_BONUS
+                    referrer.referrals += 1
+                    session.commit()
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=f"🎉 یه نفر با لینک دعوتت عضو شد! {REFERRAL_BONUS:,} 💸 به موجودیت اضافه شد!"
+                    )
+                    logger.debug(f"🎁 پاداش دعوت برای {referrer_id} توسط {user_id}")
 
-    # Check channel membership
-    if not await check_membership(context.bot, user_id):
-        keyboard = [[InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/hadscash")]]
+        # Check channel membership
+        if not await check_membership(context.bot, user_id):
+            keyboard = [[InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/hadscash")]]
+            await update.message.reply_text(
+                "🚫 لطفاً اول توی کانال @hadscash عضو شو و بعد دوباره /start بزن! 😊",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            logger.debug(f"⛔ کاربر {user_id} عضو کانال نیست، درخواست عضویت")
+            session.close()
+            return
+
+        # Notify admin of new member
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🌟 کاربر جدید:\n�ID: {user_id}\n👤 Username: {username}"
+        )
+        logger.debug(f"📩 ادمین از کاربر جدید {user_id} مطلع شد")
+
+        # Welcome message
         await update.message.reply_text(
-            "🚫 لطفاً اول توی کانال @hadscash عضو شو و بعد دوباره /start بزن! 😊",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            "🎉 به ربات *حدس کَش* خوش اومدی! 😎\nبا حدس عدد درست (۱ تا ۱۰۰۰) می‌تونی پول دربیاری! 💰",
+            reply_markup=get_main_menu(),
+            parse_mode="Markdown"
         )
-        logger.debug(f"⛔ کاربر {user_id} عضو کانال نیست، درخواست عضویت")
+        logger.debug(f"✅ پیام خوش‌آمد به کاربر {user_id} ارسال شد")
+    except Exception as e:
+        logger.error(f"❌ خطا در پردازش /start برای کاربر {user_id}: {e}")
+        await update.message.reply_text("❌ یه مشکلی پیش اومد! لطفاً دوباره امتحان کن یا با پشتیبانی تماس بگیر! 😕")
+    finally:
         session.close()
-        return
-
-    # Notify admin of new member
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"🌟 کاربر جدید:\n🆔 ID: {user_id}\n👤 Username: {username}"
-    )
-    logger.debug(f"📩 ادمین از کاربر جدید {user_id} مطلع شد")
-
-    # Welcome message
-    await update.message.reply_text(
-        "🎉 به ربات *حدس کَش* خوش اومدی! 😎\nبا حدس عدد درست (۱ تا ۱۰۰۰) می‌تونی پول دربیاری! 💰",
-        reply_markup=get_main_menu(),
-        parse_mode="Markdown"
-    )
-    logger.debug(f"✅ پیام خوش‌آمد به کاربر {user_id} ارسال شد")
-    session.close()
 
 # Admin command to set winning number
 async def set_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,10 +184,14 @@ async def set_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لطفاً عدد رو وارد کن: /set_number <عدد> 🔢")
         logger.debug(f"⛔ عدد برای set_number توسط {user_id} وارد نشده")
         return
-    global WINNING_NUMBER
-    WINNING_NUMBER = int(context.args[0])
-    await update.message.reply_text(f"🎯 عدد برنده به {WINNING_NUMBER} تغییر کرد! ✅")
-    logger.debug(f"🔢 عدد برنده به {WINNING_NUMBER} توسط ادمین {user_id} تنظیم شد")
+    try:
+        global WINNING_NUMBER
+        WINNING_NUMBER = int(context.args[0])
+        await update.message.reply_text(f"🎯 عدد برنده به {WINNING_NUMBER} تغییر کرد! ✅")
+        logger.debug(f"🔢 عدد برنده به {WINNING_NUMBER} توسط ادمین {user_id} تنظیم شد")
+    except ValueError:
+        await update.message.reply_text("❌ لطفاً یه عدد معتبر وارد کن! 🔢")
+        logger.debug(f"⛔ ورودی غیرعددی برای set_number توسط {user_id}: {context.args[0]}")
 
 # Handle button clicks
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,268 +202,289 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.debug(f"🖱️ دکمه کلیک شده توسط {user_id}: {data}")
 
     session = Session()
-    user = session.query(User).filter_by(user_id=user_id).first()
-
-    if data == "main_menu":
-        await query.message.reply_text("🏠 منوی اصلی:", reply_markup=get_main_menu())
-        logger.debug(f"🏠 منوی اصلی برای {user_id} نمایش داده شد")
-        session.close()
-        return
-
-    if data == "start_game":
-        now = datetime.now()
-        last_guess = user.last_free_guess or now - timedelta(days=8)
-        if (now - last_guess).days >= 7:
-            user.guesses_left = 1
-            user.last_free_guess = now
-            session.commit()
-            logger.debug(f"🎟️ شانس رایگان برای {user_id} ریست شد")
-        if user.guesses_left == 0 and user.balance < MIN_BALANCE_FOR_GUESS:
-            await query.message.reply_text(
-                "❌ اوه! شانس یا موجودیت کافی نیست! 😕\nبرای ادامه می‌تونی:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
-                reply_markup=get_main_menu()
-            )
-            logger.debug(f"⛔ کاربر {user_id} شانس یا موجودی کافی نداره")
+    try:
+        user = session.query(User).filter_by(user_id=user_id).first()
+        if not user:
+            await query.message.reply_text("❌ کاربر پیدا نشد! لطفاً دوباره /start بزن! 😕")
+            logger.debug(f"⛔ کاربر {user_id} در دیتابیس پیدا نشد")
             session.close()
             return
-        await query.message.reply_text(
-            "🎲 یه عدد بین ۱ تا ۱۰۰۰ حدس بزن! 🔢",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        context.user_data["state"] = "guessing"
-        logger.debug(f"🎮 کاربر {user_id} شروع به حدس زدن کرد")
-        session.close()
-        return
 
-    if data == "profile":
-        await query.message.reply_text(
-            f"👤 *پروفایلت*:\n🆔 *ID*: {user_id}\n📛 *نام*: {user.username}\n💸 *موجودی*: {user.balance:,} تومان\n👥 *دعوت‌ها*: {user.referrals}\n🏆 *کل درآمد*: {user.total_earned:,} تومان",
-            reply_markup=get_main_menu(),
-            parse_mode="Markdown"
-        )
-        logger.debug(f"📋 پروفایل برای {user_id} نمایش داده شد")
-        session.close()
-        return
+        if data == "main_menu":
+            await query.message.reply_text("🏠 منوی اصلی:", reply_markup=get_main_menu())
+            logger.debug(f"🏠 منوی اصلی برای {user_id} نمایش داده شد")
+            session.close()
+            return
 
-    if data == "invite":
-        referral_link = f"https://t.me/HadsCashBot?start={user_id}"
-        await query.message.reply_text(
-            f"📩 دوستاتو دعوت کن و برای هر نفر {REFERRAL_BONUS:,} تومان بگیر! 💰\nلینکت:\n{referral_link}\n\n🎉 *حدس کَش*: با حدس عدد درست پول دربیار! 😎",
-            reply_markup=get_main_menu(),
-            parse_mode="Markdown"
-        )
-        logger.debug(f"🔗 لینک دعوت به {user_id} ارسال شد")
-        session.close()
-        return
+        if data == "start_game":
+            now = datetime.now()
+            last_guess = user.last_free_guess or now - timedelta(days=8)
+            if (now - last_guess).days >= 7:
+                user.guesses_left = 1
+                user.last_free_guess = now
+                session.commit()
+                logger.debug(f"🎟️ شانس رایگان برای {user_id} ریست شد")
+            if user.guesses_left == 0 and user.balance < MIN_BALANCE_FOR_GUESS:
+                await query.message.reply_text(
+                    "❌ اوه! شانس یا موجودیت کافی نیست! 😕\nبرای ادامه می‌تونی:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
+                    reply_markup=get_main_menu()
+                )
+                logger.debug(f"⛔ کاربر {user_id} شانس یا موجودی کافی نداره")
+                session.close()
+                return
+            await query.message.reply_text(
+                "🎲 یه عدد بین ۱ تا ۱۰۰۰ حدس بزن! 🔢",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            context.user_data["state"] = "guessing"
+            logger.debug(f"🎮 کاربر {user_id} شروع به حدس زدن کرد")
+            session.close()
+            return
 
-    if data == "balance":
-        await query.message.reply_text("💰 مدیریت موجودی:", reply_markup=get_balance_menu())
-        logger.debug(f"📊 منوی موجودی برای {user_id} نمایش داده شد")
-        session.close()
-        return
+        if data == "profile":
+            await query.message.reply_text(
+                f"👤 *پروفایلت*:\n�ID: {user_id}\n📛 *نام*: {user.username}\n💸 *موجودی*: {user.balance:,} تومان\n👥 *دعوت‌ها*: {user.referrals}\n🏆 *کل درآمد*: {user.total_earned:,} تومان",
+                reply_markup=get_main_menu(),
+                parse_mode="Markdown"
+            )
+            logger.debug(f"📋 پروفایل برای {user_id} نمایش داده شد")
+            session.close()
+            return
 
-    if data == "show_balance":
-        await query.message.reply_text(
-            f"💸 موجودیت: {user.balance:,} تومان 😎",
-            reply_markup=get_main_menu()
-        )
-        logger.debug(f"💰 موجودی برای {user_id}: {user.balance}")
-        session.close()
-        return
+        if data == "invite":
+            referral_link = f"https://t.me/HadsCashBot?start={user_id}"
+            await query.message.reply_text(
+                f"📩 دوستاتو دعوت کن و برای هر نفر {REFERRAL_BONUS:,} تومان بگیر! 💰\nلینکت:\n{referral_link}\n\n🎉 *حدس کَش*: با حدس عدد درست پول دربیار! 😎",
+                reply_markup=get_main_menu(),
+                parse_mode="Markdown"
+            )
+            logger.debug(f"🔗 لینک دعوت به {user_id} ارسال شد")
+            session.close()
+            return
 
-    if data == "increase_balance":
-        await query.message.reply_text(
-            "💳 مبلغی که می‌خوای به موجودیت اضافه کنی رو وارد کن (مثال: 50000) 🔢",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        context.user_data["state"] = "increase_balance_amount"
-        logger.debug(f"💳 کاربر {user_id} برای افزایش موجودی درخواست داد")
+        if data == "balance":
+            await query.message.reply_text("💰 مدیریت موجودی:", reply_markup=get_balance_menu())
+            logger.debug(f"📊 منوی موجودی برای {user_id} نمایش داده شد")
+            session.close()
+            return
+
+        if data == "show_balance":
+            await query.message.reply_text(
+                f"💸 موجودیت: {user.balance:,} تومان 😎",
+                reply_markup=get_main_menu()
+            )
+            logger.debug(f"💰 موجودی برای {user_id}: {user.balance}")
+            session.close()
+            return
+
+        if data == "increase_balance":
+            await query.message.reply_text(
+                "💳 مبلغی که می‌خوای به موجودیت اضافه کنی رو وارد کن (مثال: 50000) 🔢",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            context.user_data["state"] = "increase_balance_amount"
+            logger.debug(f"💳 کاربر {user_id} برای افزایش موجودی درخواست داد")
+            session.close()
+            return
+    except Exception as e:
+        logger.error(f"❌ خطا در پردازش دکمه برای کاربر {user_id}: {e}")
+        await query.message.reply_text("❌ یه مشکلی پیش اومد! لطفاً دوباره امتحان کن! 😕")
         session.close()
-        return
 
 # Handle user messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = context.user_data.get("state")
-    logger.debug(f"📩 پیام دریافتی از {user_id} در حالت {state}: {update.message.text}")
+    text = update.message.text if update.message.text else ""
+    logger.debug(f"📩 پیام دریافتی از {user_id} در حالت {state}: {text}")
 
     session = Session()
-    user = session.query(User).filter_by(user_id=user_id).first()
-
-    if state == "guessing":
-        try:
-            guess = int(update.message.text)
-            if not 1 <= guess <= 1000:
-                await update.message.reply_text("❌ لطفاً یه عدد بین ۱ تا ۱۰۰۰ وارد کن! 🔢")
-                logger.debug(f"⛔ حدس نامعتبر توسط {user_id}: {guess}")
-                session.close()
-                return
-            if user.guesses_left > 0:
-                user.guesses_left -= 1
-                logger.debug(f"🎟️ شانس رایگان برای {user_id} استفاده شد")
-            else:
-                if user.balance < MIN_BALANCE_FOR_GUESS:
-                    await update.message.reply_text(
-                        "❌ موجودیت کافی نیست! 😕\nبرای ادامه می‌تونی:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
-                        reply_markup=get_main_menu()
-                    )
-                    logger.debug(f"⛔ کاربر {user_id} موجودی کافی نداره")
-                    session.close()
-                    return
-                user.balance -= MIN_BALANCE_FOR_GUESS
-                logger.debug(f"💸 کسر {MIN_BALANCE_FOR_GUESS} از موجودی {user_id}")
-
-            if guess == WINNING_NUMBER:
-                prize = 100000  # Example prize, adjust as needed
-                user.balance += prize
-                user.total_earned += prize
-                await update.message.reply_text(
-                    f"🎉 *تبریک*! برنده {prize:,} تومان شدی! 🤑",
-                    reply_markup=get_main_menu(),
-                    parse_mode="Markdown"
-                )
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"🏆 *برنده جدید*!\n🆔 ID: {user_id}\n👤 Username: {user.username}\n🎁 جایزه: {prize:,} تومان\n👥 تعداد دعوت‌ها: {user.referrals}\n🏆 کل درآمد: {user.total_earned:,} تومان",
-                    parse_mode="Markdown"
-                )
-                logger.debug(f"🎉 کاربر {user_id} با حدس {guess} برنده {prize} شد")
-            else:
-                await update.message.reply_text(
-                    "❌ اشتباه بود! 😕 شانس یا موجودیت تموم شد. برای ادامه:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
-                    reply_markup=get_main_menu()
-                )
-                logger.debug(f"⛔ حدس اشتباه توسط {user_id}: {guess}")
-            session.commit()
-            context.user_data["state"] = None
-        except ValueError:
-            await update.message.reply_text("❌ لطفاً یه عدد معتبر وارد کن! 🔢")
-            logger.debug(f"⛔ حدس غیرعددی توسط {user_id}: {update.message.text}")
-        session.close()
-        return
-
-    if state == "increase_balance_amount":
-        try:
-            amount = int(update.message.text)
-            if amount <= 0:
-                await update.message.reply_text("❌ مبلغ باید معتبر باشه! مثلاً 50000 🔢")
-                logger.debug(f"⛔ مبلغ نامعتبر توسط {user_id}: {update.message.text}")
-                session.close()
-                return
-            tron_amount = await toman_to_tron(amount)
-            context.user_data["deposit_amount"] = amount
-            await update.message.reply_text(
-                f"💳 برای افزایش موجودی {amount:,} تومان، لطفاً {tron_amount:.2f} TRX به این آدرس واریز کن:\n`{TRON_ADDRESS}`\n\n📸 بعد از واریز، اسکرین‌شات پرداخت رو اینجا بفرست! 😊",
-                reply_markup=ReplyKeyboardRemove(),
-                parse_mode="Markdown"
-            )
-            context.user_data["state"] = "awaiting_screenshot"
-            logger.debug(f"💸 درخواست واریز {amount} تومان ({tron_amount} TRX) توسط {user_id}")
-            session.close()
-        except ValueError:
-            await update.message.reply_text("❌ لطفاً یه عدد معتبر وارد کن! 🔢")
-            logger.debug(f"⛔ ورودی غیرعددی برای مبلغ توسط {user_id}: {update.message.text}")
-            session.close()
-        return
-
-    if state == "awaiting_screenshot":
-        if update.message.photo:
-            amount = context.user_data.get("deposit_amount", 0)
-            await context.bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=update.message.photo[-1].file_id,
-                caption=f"📸 اسکرین‌شات پرداخت از:\n🆔 ID: {user_id}\n👤 Username: {user.username}\n💳 مبلغ: {amount:,} تومان"
-            )
-            await update.message.reply_text(
-                "✅ اسکرین‌شات دریافت شد! ادمین بررسی می‌کنه و موجودیت به‌زودی افزایش پیدا می‌کنه! 😊",
-                reply_markup=get_main_menu()
-            )
-            logger.debug(f"📸 اسکرین‌شات پرداخت از {user_id} برای {amount} تومان به ادمین ارسال شد")
-            context.user_data["state"] = None
-            context.user_data["deposit_amount"] = 0
-        else:
-            await update.message.reply_text("❌ لطفاً اسکرین‌شات پرداخت رو بفرست! 📸")
-            logger.debug(f"⛔ پیام غیرعکس در حالت انتظار اسکرین‌شات از {user_id}")
-        session.close()
-        return
-
-    # Handle main menu selections
-    if update.message.text == "🎮 شروع بازی":
-        now = datetime.now()
-        last_guess = user.last_free_guess or now - timedelta(days=8)
-        if (now - last_guess).days >= 7:
-            user.guesses_left = 1
-            user.last_free_guess = now
-            session.commit()
-            logger.debug(f"🎟️ شانس رایگان برای {user_id} ریست شد")
-        if user.guesses_left == 0 and user.balance < MIN_BALANCE_FOR_GUESS:
-            await update.message.reply_text(
-                "❌ اوه! شانس یا موجودیت کافی نیست! 😕\nبرای ادامه می‌تونی:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
-                reply_markup=get_main_menu()
-            )
-            logger.debug(f"⛔ کاربر {user_id} شانس یا موجودی کافی نداره")
+    try:
+        user = session.query(User).filter_by(user_id=user_id).first()
+        if not user and state not in ["increase_balance_amount", "awaiting_screenshot"]:
+            await update.message.reply_text("❌ کاربر پیدا نشد! لطفاً دوباره /start بزن! 😕")
+            logger.debug(f"⛔ کاربر {user_id} در دیتابیس پیدا نشد")
             session.close()
             return
-        await update.message.reply_text(
-            "🎲 یه عدد بین ۱ تا ۱۰۰۰ حدس بزن! 🔢",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        context.user_data["state"] = "guessing"
-        logger.debug(f"🎮 کاربر {user_id} شروع به حدس زدن کرد")
-        session.close()
-        return
 
-    if update.message.text == "👤 پروفایل":
-        await update.message.reply_text(
-            f"👤 *پروفایلت*:\n🆔 *ID*: {user_id}\n📛 *نام*: {user.username}\n💸 *موجودی*: {user.balance:,} تومان\n👥 *دعوت‌ها*: {user.referrals}\n🏆 *کل درآمد*: {user.total_earned:,} تومان",
-            reply_markup=get_main_menu(),
-            parse_mode="Markdown"
-        )
-        logger.debug(f"📋 پروفایل برای {user_id} نمایش داده شد")
-        session.close()
-        return
+        if state == "guessing":
+            try:
+                guess = int(text)
+                if not 1 <= guess <= 1000:
+                    await update.message.reply_text("❌ لطفاً یه عدد بین ۱ تا ۱۰۰۰ وارد کن! 🔢")
+                    logger.debug(f"⛔ حدس نامعتبر توسط {user_id}: {guess}")
+                    session.close()
+                    return
+                if user.guesses_left > 0:
+                    user.guesses_left -= 1
+                    logger.debug(f"🎟️ شانس رایگان برای {user_id} استفاده شد")
+                else:
+                    if user.balance < MIN_BALANCE_FOR_GUESS:
+                        await update.message.reply_text(
+                            "❌ موجودیت کافی نیست! 😕\nبرای ادامه می‌تونی:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
+                            reply_markup=get_main_menu()
+                        )
+                        logger.debug(f"⛔ کاربر {user_id} موجودی کافی نداره")
+                        session.close()
+                        return
+                    user.balance -= MIN_BALANCE_FOR_GUESS
+                    logger.debug(f"💸 کسر {MIN_BALANCE_FOR_GUESS} از موجودی {user_id}")
 
-    if update.message.text == "📩 دعوت دوستان":
-        referral_link = f"https://t.me/HadsCashBot?start={user_id}"
-        await update.message.reply_text(
-            f"📩 دوستاتو دعوت کن و برای هر نفر {REFERRAL_BONUS:,} تومان بگیر! 💰\nلینکت:\n{referral_link}\n\n🎉 *حدس کَش*: با حدس عدد درست پول دربیار! 😎",
-            reply_markup=get_main_menu(),
-            parse_mode="Markdown"
-        )
-        logger.debug(f"🔗 لینک دعوت به {user_id} ارسال شد")
-        session.close()
-        return
+                if guess == WINNING_NUMBER:
+                    prize = 100000  # Example prize, adjust as needed
+                    user.balance += prize
+                    user.total_earned += prize
+                    await update.message.reply_text(
+                        f"🎉 *تبریک*! برنده {prize:,} تومان شدی! 🤑",
+                        reply_markup=get_main_menu(),
+                        parse_mode="Markdown"
+                    )
+                    await context.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"🏆 *برنده جدید*!\n�ID: {user_id}\n👤 Username: {user.username}\n🎁 جایزه: {prize:,} تومان\n👥 تعداد دعوت‌ها: {user.referrals}\n🏆 کل درآمد: {user.total_earned:,} تومان",
+                        parse_mode="Markdown"
+                    )
+                    logger.debug(f"🎉 کاربر {user_id} با حدس {guess} برنده {prize} شد")
+                else:
+                    await update.message.reply_text(
+                        "❌ اشتباه بود! 😕 شانس یا موجودیت تموم شد. برای ادامه:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
+                        reply_markup=get_main_menu()
+                    )
+                    logger.debug(f"⛔ حدس اشتباه توسط {user_id}: {guess}")
+                session.commit()
+                context.user_data["state"] = None
+            except ValueError:
+                await update.message.reply_text("❌ لطفاً یه عدد معتبر وارد کن! 🔢")
+                logger.debug(f"⛔ حدس غیرعددی توسط {user_id}: {text}")
+            session.close()
+            return
 
-    if update.message.text == "💰 موجودی":
-        await update.message.reply_text("💰 مدیریت موجودی:", reply_markup=get_balance_menu())
-        logger.debug(f"📊 منوی موجودی برای {user_id} نمایش داده شد")
-        session.close()
-        return
+        if state == "increase_balance_amount":
+            try:
+                amount = int(text)
+                if amount <= 0:
+                    await update.message.reply_text("❌ مبلغ باید معتبر باشه! مثلاً 50000 🔢")
+                    logger.debug(f"⛔ مبلغ نامعتبر توسط {user_id}: {text}")
+                    session.close()
+                    return
+                tron_amount = await toman_to_tron(amount)
+                context.user_data["deposit_amount"] = amount
+                await update.message.reply_text(
+                    f"💳 برای افزایش موجودی {amount:,} تومان، لطفاً {tron_amount:.2f} TRX به این آدرس واریز کن:\n`{TRON_ADDRESS}`\n\n📸 بعد از واریز، اسکرین‌شات پرداخت رو اینجا بفرست! 😊",
+                    reply_markup=ReplyKeyboardRemove(),
+                    parse_mode="Markdown"
+                )
+                context.user_data["state"] = "awaiting_screenshot"
+                logger.debug(f"💸 درخواست واریز {amount} تومان ({tron_amount} TRX) توسط {user_id}")
+                session.close()
+            except ValueError:
+                await update.message.reply_text("❌ لطفاً یه عدد معتبر وارد کن! 🔢")
+                logger.debug(f"⛔ ورودی غیرعددی برای مبلغ توسط {user_id}: {text}")
+                session.close()
+            return
 
-    if update.message.text == "💸 نمایش موجودی":
-        await update.message.reply_text(
-            f"💸 موجودیت: {user.balance:,} تومان 😎",
-            reply_markup=get_main_menu()
-        )
-        logger.debug(f"💰 موجودی برای {user_id}: {user.balance}")
-        session.close()
-        return
+        if state == "awaiting_screenshot":
+            if update.message.photo:
+                amount = context.user_data.get("deposit_amount", 0)
+                await context.bot.send_photo(
+                    chat_id=ADMIN_ID,
+                    photo=update.message.photo[-1].file_id,
+                    caption=f"📸 اسکرین‌شات پرداخت از:\n�ID: {user_id}\n👤 Username: {user.username}\n💳 مبلغ: {amount:,} تومان"
+                )
+                await update.message.reply_text(
+                    "✅ اسکرین‌شات دریافت شد! ادمین بررسی می‌کنه و موجودیت به‌زودی افزایش پیدا می‌کنه! 😊",
+                    reply_markup=get_main_menu()
+                )
+                logger.debug(f"📸 اسکرین‌شات پرداخت از {user_id} برای {amount} تومان به ادمین ارسال شد")
+                context.user_data["state"] = None
+                context.user_data["deposit_amount"] = 0
+            else:
+                await update.message.reply_text("❌ لطفاً اسکرین‌شات پرداخت رو بفرست! 📸")
+                logger.debug(f"⛔ پیام غیرعکس در حالت انتظار اسکرین‌شات از {user_id}")
+            session.close()
+            return
 
-    if update.message.text == "💳 افزایش موجودی":
-        await update.message.reply_text(
-            "💳 مبلغی که می‌خوای به موجودیت اضافه کنی رو وارد کن (مثال: 50000) 🔢",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        context.user_data["state"] = "increase_balance_amount"
-        logger.debug(f"💳 کاربر {user_id} برای افزایش موجودی درخواست داد")
-        session.close()
-        return
+        # Handle main menu selections
+        if text == "🎮 شروع بازی":
+            now = datetime.now()
+            last_guess = user.last_free_guess or now - timedelta(days=8)
+            if (now - last_guess).days >= 7:
+                user.guesses_left = 1
+                user.last_free_guess = now
+                session.commit()
+                logger.debug(f"🎟️ شانس رایگان برای {user_id} ریست شد")
+            if user.guesses_left == 0 and user.balance < MIN_BALANCE_FOR_GUESS:
+                await update.message.reply_text(
+                    "❌ اوه! شانس یا موجودیت کافی نیست! 😕\nبرای ادامه می‌تونی:\n1️⃣ دوستاتو دعوت کن 📩\n2️⃣ موجودیتو افزایش بده 💳\n3️⃣ تا هفته بعد صبر کن ⏳",
+                    reply_markup=get_main_menu()
+                )
+                logger.debug(f"⛔ کاربر {user_id} شانس یا موجودی کافی نداره")
+                session.close()
+                return
+            await update.message.reply_text(
+                "🎲 یه عدد بین ۱ تا ۱۰۰۰ حدس بزن! 🔢",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            context.user_data["state"] = "guessing"
+            logger.debug(f"🎮 کاربر {user_id} شروع به حدس زدن کرد")
+            session.close()
+            return
 
-    if update.message.text == "🔙 بازگشت به منو":
-        await update.message.reply_text("🏠 منوی اصلی:", reply_markup=get_main_menu())
-        logger.debug(f"🏠 منوی اصلی برای {user_id} نمایش داده شد")
+        if text == "👤 پروفایل":
+            await update.message.reply_text(
+                f"👤 *پروفایلت*:\n�ID: {user_id}\n📛 *نام*: {user.username}\n💸 *موجودی*: {user.balance:,} تومان\n👥 *دعوت‌ها*: {user.referrals}\n🏆 *کل درآمد*: {user.total_earned:,} تومان",
+                reply_markup=get_main_menu(),
+                parse_mode="Markdown"
+            )
+            logger.debug(f"📋 پروفایل برای {user_id} نمایش داده شد")
+            session.close()
+            return
+
+        if text == "📩 دعوت دوستان":
+            referral_link = f"https://t.me/HadsCashBot?start={user_id}"
+            await update.message.reply_text(
+                f"📩 دوستاتو دعوت کن و برای هر نفر {REFERRAL_BONUS:,} تومان بگیر! 💰\nلینکت:\n{referral_link}\n\n🎉 *حدس کَش*: با حدس عدد درست پول دربیار! 😎",
+                reply_markup=get_main_menu(),
+                parse_mode="Markdown"
+            )
+            logger.debug(f"🔗 لینک دعوت به {user_id} ارسال شد")
+            session.close()
+            return
+
+        if text == "💰 موجودی":
+            await update.message.reply_text("💰 مدیریت موجودی:", reply_markup=get_balance_menu())
+            logger.debug(f"📊 منوی موجودی برای {user_id} نمایش داده شد")
+            session.close()
+            return
+
+        if text == "💸 نمایش موجودی":
+            await update.message.reply_text(
+                f"💸 موجودیت: {user.balance:,} تومان 😎",
+                reply_markup=get_main_menu()
+            )
+            logger.debug(f"💰 موجودی برای {user_id}: {user.balance}")
+            session.close()
+            return
+
+        if text == "💳 افزایش موجودی":
+            await update.message.reply_text(
+                "💳 مبلغی که می‌خوای به موجودیت اضافه کنی رو وارد کن (مثال: 50000) 🔢",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            context.user_data["state"] = "increase_balance_amount"
+            logger.debug(f"💳 کاربر {user_id} برای افزایش موجودی درخواست داد")
+            session.close()
+            return
+
+        if text == "🔙 بازگشت به منو":
+            await update.message.reply_text("🏠 منوی اصلی:", reply_markup=get_main_menu())
+            logger.debug(f"🏠 منوی اصلی برای {user_id} نمایش داده شد")
+            session.close()
+            return
+    except Exception as e:
+        logger.error(f"❌ خطا در پردازش پیام برای کاربر {user_id}: {e}")
+        await update.message.reply_text("❌ یه مشکلی پیش اومد! لطفاً دوباره امتحان کن! 😕")
         session.close()
-        return
 
 # Webhook handler
 @app.post(WEBHOOK_PATH)

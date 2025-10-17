@@ -142,15 +142,34 @@ async def get_bot_stats():
             # Total referred users
             total_referred = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
             
+            # New users today
+            new_users_today = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'"
+            )
+            
+            # New users this week
+            new_users_week = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'"
+            )
+            
             return {
                 "total_users": total_users,
                 "active_users": active_users,
                 "total_income": total_income,
-                "total_referred": total_referred
+                "total_referred": total_referred,
+                "new_users_today": new_users_today,
+                "new_users_week": new_users_week
             }
     except Exception as e:
         logger.error(f"❌ Error getting bot stats: {e}")
-        return {"total_users": 0, "active_users": 0, "total_income": 0, "total_referred": 0}
+        return {
+            "total_users": 0, 
+            "active_users": 0, 
+            "total_income": 0, 
+            "total_referred": 0,
+            "new_users_today": 0,
+            "new_users_week": 0
+        }
 
 async def get_all_users():
     """Get all users data"""
@@ -319,7 +338,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}"
+                text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}\n📊 تعداد کل کاربران: {(await get_bot_stats())['total_users']:,}"
             )
             logger.info(f"📢 Admin notified of new user {user_id}")
         except Exception as e:
@@ -375,6 +394,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🟢 کاربران فعال (24h): {stats_data['active_users']:,}\n"
         f"💰 درآمد کل ربات: {stats_data['total_income']:,} تومان\n"
         f"👥 تعداد کاربران دعوت شده: {stats_data['total_referred']:,}\n"
+        f"🆕 کاربران جدید امروز: {stats_data['new_users_today']:,}\n"
+        f"📈 کاربران جدید این هفته: {stats_data['new_users_week']:,}\n"
         f"🔘 وضعیت ربات: {'🟢 روشن' if bot_enabled else '🔴 خاموش'}"
     )
 
@@ -833,7 +854,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ لطفاً یک عدد معتبر وارد کنید! 🔢")
         logger.info(f"❌ Non-numeric guess by {user_id}: {text}")
 
-# Show user profile
+# Show user profile - FIXED FUNCTION
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await refresh_free_guess(user_id)
@@ -857,12 +878,14 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👤 پروفایل شما:\n\n"
             f"🆔 ID: {user_id}\n"
-            f"📛 نام کاربری: @{user.get('username', 'Unknown')}\n"
+            f"📛 نام کاربری: @{user.get('username', 'بدون یوزرنیم')}\n"
             f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
             f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
             f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
             f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
-            f"🆓 فرصت رایگان بعدی: {next_free_guess}",
+            f"💸 کل هزینه: {user.get('total_spent', 0):,} تومان\n"
+            f"🆓 فرصت رایگان بعدی: {next_free_guess}\n"
+            f"🕒 عضویت: {user.get('created_at').strftime('%Y-%m-%d %H:%M')}",
             reply_markup=get_main_menu()
         )
         logger.info(f"📊 Profile shown for {user_id}")

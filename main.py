@@ -82,31 +82,20 @@ async def get_user(user_id: int):
             user = await conn.fetchrow(
                 "SELECT * FROM users WHERE user_id = $1", user_id
             )
-            if user:
-                return dict(user)
-            else:
-                return None
+            return dict(user) if user else None
     except Exception as e:
         logger.error(f"❌ Error getting user {user_id}: {e}")
         return None
 
-async def create_user(user_id: int, username: str, referrer_id: int = None):
+async def create_user(user_id: int, username: str):
     """Create new user in database"""
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO users (user_id, username, balance, guesses_left, referrer_id) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id) DO NOTHING",
-                user_id, username, 0, 1, referrer_id
+                "INSERT INTO users (user_id, username, balance, guesses_left) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO NOTHING",
+                user_id, username, 0, 1
             )
             logger.info(f"✅ New user created: {user_id}")
-            
-            # If there's a referrer, update their referrals count and balance
-            if referrer_id:
-                await conn.execute(
-                    "UPDATE users SET balance = balance + $1, referrals = referrals + 1 WHERE user_id = $2",
-                    REFERRAL_BONUS, referrer_id
-                )
-                logger.info(f"🎁 Referral bonus added for {referrer_id} by {user_id}")
     except Exception as e:
         logger.error(f"❌ Error creating user {user_id}: {e}")
 
@@ -153,19 +142,15 @@ async def get_bot_stats():
             # Total referred users
             total_referred = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
             
-            # Total balance in system
-            total_balance = await conn.fetchval("SELECT COALESCE(SUM(balance), 0) FROM users")
-            
             return {
                 "total_users": total_users,
                 "active_users": active_users,
                 "total_income": total_income,
-                "total_referred": total_referred,
-                "total_balance": total_balance
+                "total_referred": total_referred
             }
     except Exception as e:
         logger.error(f"❌ Error getting bot stats: {e}")
-        return {"total_users": 0, "active_users": 0, "total_income": 0, "total_referred": 0, "total_balance": 0}
+        return {"total_users": 0, "active_users": 0, "total_income": 0, "total_referred": 0}
 
 async def get_all_users():
     """Get all users data"""
@@ -260,6 +245,23 @@ def get_winning_number(user_id: int):
         return generate_winning_number(user_id)
     return user_winning_numbers[user_id]
 
+async def refresh_free_guess(user_id: int):
+    user = await get_user(user_id)
+    if not user:
+        return
+    now = datetime.now()
+    last_guess = user.get("last_free_guess")
+    reset = False
+    if last_guess:
+        last_guess = last_guess.replace(tzinfo=None) if last_guess.tzinfo else last_guess
+        if (now - last_guess).days >= 7:
+            reset = True
+    else:
+        reset = True
+    if reset:
+        await update_user(user_id, guesses_left=1, last_free_guess=now)
+        logger.info(f"🆓 Free guess reset for {user_id}")
+
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -287,39 +289,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Initialize user data if new
     user = await get_user(user_id)
     was_new = False
-    
-    # Check for referral
-    referrer_id = None
-    args = context.args
-    if args and args[0].isdigit():
-        referrer_id = int(args[0])
-        if referrer_id == user_id:
-            referrer_id = None  # User can't refer themselves
-    
     if not user:
         was_new = True
-        await create_user(user_id, username, referrer_id)
+        await create_user(user_id, username)
         user = await get_user(user_id)
         logger.info(f"👤 New user initialized: {user_id}")
         
-        # Notify referrer about new referral
-        if referrer_id:
-            try:
+        # Check for referral only for new users
+        args = context.args
+        if args and args[0].isdigit():
+            referrer_id = int(args[0])
+            if referrer_id != user_id:
                 referrer = await get_user(referrer_id)
                 if referrer:
+                    new_balance = referrer["balance"] + REFERRAL_BONUS
+                    new_referrals = referrer["referrals"] + 1
+                    await update_user(referrer_id, balance=new_balance, referrals=new_referrals)
+                    
                     await context.bot.send_message(
                         chat_id=referrer_id,
-                        text=f"🎉 یک نفر با لینک دعوت شما عضو شد!\n\n💰 {REFERRAL_BONUS:,} تومان به موجودی شما اضافه شد.\n💸 موجودی جدید: {referrer['balance'] + REFERRAL_BONUS:,} تومان"
+                        text=f"🎉 یک نفر با لینک دعوت شما عضو شد! {REFERRAL_BONUS:,} تومان به موجودی شما اضافه شد. 💰"
                     )
-                    logger.info(f"📢 Referrer {referrer_id} notified about new referral {user_id}")
-            except Exception as e:
-                logger.error(f"❌ Error notifying referrer: {e}")
+                    logger.info(f"🎁 Referral bonus added for {referrer_id} by {user_id}")
+                    
+                    # Set referrer for new user
+                    await update_user(user_id, referrer_id=referrer_id)
         
         # Notify admin only for new users
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}\n📊 کل کاربران: {(await get_bot_stats())['total_users']}"
+                text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}"
             )
             logger.info(f"📢 Admin notified of new user {user_id}")
         except Exception as e:
@@ -347,19 +347,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Error setting commands: {e}")
     
     # Welcome message
-    welcome_text = "🎮 به ربات حدس کَش خوش آمدید! ✨\n\n🎲 با حدس عدد درست (۱ تا ۱۰۰۰) می‌توانید درآمد کسب کنید! 💰\n\n🆓 هر هفته یک فرصت رایگان دارید!\n👥 با دعوت دوستان موجودی خود را افزایش دهید!\n💳 با افزایش موجودی هم می‌توانید بازی کنید!"
-    
-    if referrer_id and was_new:
-        welcome_text += f"\n\n🎁 شما با لینک دعوت کاربر دیگر عضو شدید و یک فرصت رایگان دارید!"
-    
-    await update.message.reply_text(welcome_text, reply_markup=get_main_menu())
+    await update.message.reply_text(
+        "🎮 به ربات حدس کَش خوش آمدید! ✨\n\n"
+        "🎲 با حدس عدد درست (۱ تا ۱۰۰۰) می‌توانید درآمد کسب کنید! 💰\n\n"
+        "🆓 هر هفته یک فرصت رایگان دارید!\n"
+        "👥 با دعوت دوستان موجودی خود را افزایش دهید!\n"
+        "💳 با افزایش موجودی هم می‌توانید بازی کنید!",
+        reply_markup=get_main_menu()
+    )
     logger.info(f"👋 Welcome message sent to user {user_id}")
 
 # Admin command to show stats
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ شما دسترسی لازم را ندارید!")
+        logger.info(f"🚫 Unauthorized stats attempt by {user_id}")
         return
     
     stats_data = await get_bot_stats()
@@ -370,7 +372,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🟢 کاربران فعال (24h): {stats_data['active_users']:,}\n"
         f"💰 درآمد کل ربات: {stats_data['total_income']:,} تومان\n"
         f"👥 تعداد کاربران دعوت شده: {stats_data['total_referred']:,}\n"
-        f"💸 مجموع موجودی کاربران: {stats_data['total_balance']:,} تومان\n"
         f"🔘 وضعیت ربات: {'🟢 روشن' if bot_enabled else '🔴 خاموش'}"
     )
 
@@ -378,7 +379,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ شما دسترسی لازم را ندارید!")
+        logger.info(f"🚫 Unauthorized backup attempt by {user_id}")
         return
     
     await update.message.reply_text("⏳ در حال ایجاد پشتیبان از دیتابیس...")
@@ -402,7 +403,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ شما دسترسی لازم را ندارید!")
+        logger.info(f"🚫 Unauthorized clear attempt by {user_id}")
         return
     
     keyboard = [
@@ -419,7 +420,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ شما دسترسی لازم را ندارید!")
+        logger.info(f"🚫 Unauthorized users attempt by {user_id}")
         return
     
     await update.message.reply_text("⏳ در حال دریافت اطلاعات کاربران...")
@@ -430,10 +431,10 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Send in chunks to avoid message limits
-    chunk_size = 10
+    chunk_size = 20
     for i in range(0, len(all_users), chunk_size):
         chunk = all_users[i:i + chunk_size]
-        message = f"👥 اطلاعات کاربران (بخش {i//chunk_size + 1}):\n\n"
+        message = "👥 اطلاعات کاربران:\n\n"
         
         for user in chunk:
             message += (
@@ -444,7 +445,8 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👥 دعوت‌ها: {user.get('referrals', 0)}\n"
                 f"💵 درآمد: {user.get('total_earned', 0):,} تومان\n"
                 f"💸 هزینه: {user.get('total_spent', 0):,} تومان\n"
-                f"🕒 عضویت: {user.get('created_at').strftime('%Y-%m-%d')}\n"
+                f"🕒 عضویت: {user.get('created_at').strftime('%Y-%m-%d %H:%M')}\n"
+                f"🟢 آخرین فعالیت: {user.get('last_active').strftime('%Y-%m-%d %H:%M')}\n"
                 f"{'-' * 30}\n"
             )
         
@@ -453,13 +455,12 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"❌ Error sending users chunk: {e}")
             await update.message.reply_text("❌ خطا در ارسال اطلاعات کاربران!")
-            break
 
 # Admin command for broadcast
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ شما دسترسی لازم را ندارید!")
+        logger.info(f"🚫 Unauthorized broadcast attempt by {user_id}")
         return
     
     context.user_data["broadcast_mode"] = True
@@ -471,7 +472,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ شما دسترسی لازم را ندارید!")
+        logger.info(f"🚫 Unauthorized toggle attempt by {user_id}")
         return
     
     global bot_enabled
@@ -500,8 +501,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
             return
             
-        payment_user_id = int(data.split("_")[1])
-        amount = int(data.split("_")[2])
+        parts = data.split("_")
+        if len(parts) != 3:
+            await query.edit_message_text("❌ داده نامعتبر!")
+            return
+            
+        payment_user_id = int(parts[1])
+        amount = int(parts[2])
         
         user = await get_user(payment_user_id)
         if user:
@@ -522,7 +528,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"✅ پرداخت شما تأیید شد!\n\n💰 مبلغ {amount:,} تومان به موجودی شما اضافه شد.\n💸 موجودی جدید: {new_balance:,} تومان",
                     reply_markup=get_main_menu()
                 )
-                logger.info(f"💰 Payment approved for user {payment_user_id}: {amount} Toman")
             except Exception as e:
                 logger.error(f"❌ Error notifying user of payment approval: {e}")
                 
@@ -535,26 +540,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
             return
             
-        payment_user_id = int(data.split("_")[1])
+        parts = data.split("_")
+        if len(parts) != 2:
+            await query.edit_message_text("❌ داده نامعتبر!")
+            return
+            
+        payment_user_id = int(parts[1])
         
         user = await get_user(payment_user_id)
-        if user:
-            await query.edit_message_text(
-                f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
+        await query.edit_message_text(
+            f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
+        )
+        
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=payment_user_id,
+                text="❌ پرداخت شما رد شد!\n\n📞 لطفاً با پشتیبانی تماس بگیرید.",
+                reply_markup=get_main_menu()
             )
-            
-            # Notify user
-            try:
-                await context.bot.send_message(
-                    chat_id=payment_user_id,
-                    text="❌ پرداخت شما رد شد!\n\n📞 لطفاً با پشتیبانی تماس بگیرید.",
-                    reply_markup=get_main_menu()
-                )
-                logger.info(f"❌ Payment rejected for user {payment_user_id}")
-            except Exception as e:
-                logger.error(f"❌ Error notifying user of payment rejection: {e}")
-        else:
-            await query.edit_message_text("❌ کاربر یافت نشد!")
+        except Exception as e:
+            logger.error(f"❌ Error notifying user of payment rejection: {e}")
     
     # Handle database clear confirmation
     elif data == "clear_confirm":
@@ -716,28 +722,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Start game handler
 async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await refresh_free_guess(user_id)
     user = await get_user(user_id)
     
     if not user:
         await update.message.reply_text("⚠️ ابتدا با دستور /start شروع کنید!")
         return
-
-    # Check if user has free guess this week
-    now = datetime.now()
-    last_guess = user.get("last_free_guess")
-    if last_guess:
-        # Handle timezone issues
-        if hasattr(last_guess, 'tzinfo') and last_guess.tzinfo:
-            last_guess = last_guess.replace(tzinfo=None)
-        if (now - last_guess).days >= 7:
-            await update_user(user_id, guesses_left=1, last_free_guess=now)
-            user["guesses_left"] = 1
-            logger.info(f"🆓 Free guess reset for {user_id}")
-    else:
-        # If no last_free_guess, set it to now and give free guess
-        await update_user(user_id, guesses_left=1, last_free_guess=now)
-        user["guesses_left"] = 1
-        logger.info(f"🆓 Initial free guess set for {user_id}")
 
     # Check if user can guess
     if user.get("guesses_left", 0) == 0 and user.get("balance", 0) < MIN_BALANCE_FOR_GUESS:
@@ -843,18 +833,17 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Show user profile
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await refresh_free_guess(user_id)
     user = await get_user(user_id)
     
     if user:
-        # Check if user has free guess this week
+        # Calculate next free guess
         now = datetime.now()
         last_guess = user.get("last_free_guess")
         next_free_guess = "امروز"
         
         if last_guess:
-            # Handle timezone issues
-            if hasattr(last_guess, 'tzinfo') and last_guess.tzinfo:
-                last_guess = last_guess.replace(tzinfo=None)
+            last_guess = last_guess.replace(tzinfo=None) if last_guess.tzinfo else last_guess
             days_passed = (now - last_guess).days
             days_remaining = 7 - days_passed
             if days_remaining > 0:
@@ -862,7 +851,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 next_free_guess = "امروز"
         
-        profile_text = (
+        await update.message.reply_text(
             f"👤 پروفایل شما:\n\n"
             f"🆔 ID: {user_id}\n"
             f"📛 نام کاربری: @{user.get('username', 'Unknown')}\n"
@@ -870,16 +859,12 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
             f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
             f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
-            f"🆓 فرصت رایگان بعدی: {next_free_guess}"
+            f"🆓 فرصت رایگان بعدی: {next_free_guess}",
+            reply_markup=get_main_menu()
         )
-        
-        if user.get('referrer_id'):
-            profile_text += f"\n👥 شما توسط کاربر {user['referrer_id']} دعوت شده‌اید"
-        
-        await update.message.reply_text(profile_text, reply_markup=get_main_menu())
         logger.info(f"📊 Profile shown for {user_id}")
     else:
-        await update.message.reply_text("⚠️ خطا در دریافت اطلاعات پروفایل! لطفاً /start را بزنید.")
+        await update.message.reply_text("⚠️ خطا در دریافت اطلاعات پروفایل!")
 
 # Invite friends
 async def invite_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -889,30 +874,28 @@ async def invite_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📩 دعوت از دوستان\n\n"
         f"👥 دوستان خود را دعوت کنید و به ازای هر نفر {REFERRAL_BONUS:,} تومان دریافت کنید! 💰\n\n"
-        f"🔗 لینک دعوت شما:\n`{referral_link}`\n\n"
+        f"🔗 لینک دعوت شما:\n{referral_link}\n\n"
         f"📢 ربات حدس کَش:\n"
         f"🎲 با حدس عدد درست درآمد کسب کنید!\n"
-        f"🆓 هر هفته یک فرصت رایگان!\n"
-        f"💰 جایزه یک میلیون تومانی!",
-        reply_markup=get_main_menu(),
-        parse_mode="Markdown"
+        f"🆓 هر هفته یک فرصت رایگان!",
+        reply_markup=get_main_menu()
     )
     logger.info(f"📤 Invite link sent to {user_id}")
 
 # Show balance
 async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    await refresh_free_guess(user_id)
     user = await get_user(user_id)
     
     if user:
         await update.message.reply_text(
-            f"💸 موجودی شما: {user.get('balance', 0):,} تومان 💰\n\n"
-            f"💡 برای افزایش موجودی از گزینه '💳 افزایش موجودی' استفاده کنید.",
+            f"💸 موجودی شما: {user.get('balance', 0):,} تومان 💰",
             reply_markup=get_balance_menu()
         )
         logger.info(f"💰 Balance shown for {user_id}: {user.get('balance', 0)}")
     else:
-        await update.message.reply_text("⚠️ خطا در دریافت موجودی! لطفاً /start را بزنید.")
+        await update.message.reply_text("⚠️ خطا در دریافت موجودی!")
 
 # Prompt for balance increase
 async def increase_balance_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1022,12 +1005,12 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• دعوت دوستان (هر نفر ۵,۰۰۰ تومان)\n"
         "• واریز ترون (حداقل ۲۰،۰۰۰ تومان)\n\n"
         "👥 دعوت دوستان:\n"
-        f"• به ازای هر دعوت: {REFERRAL_BONUS:,} تومان\n"
+        f"• به ازای هر دعوت: 5,000 تومان\n"
         "• دوستان شما هم یک فرصت رایگان می‌گیرند\n\n"
         "❓ سوالات متداول:\n"
         "• هر کاربر هفته‌ای یک بار بصورت رایگان می‌تواند بازی کند\n"
-        "• حداقل موجودی برای بازی: {MIN_BALANCE_FOR_GUESS:,} تومان\n"
-        "• جایزه برنده: {PRIZE_AMOUNT:,} تومان",
+        "• حداقل موجودی برای بازی: ۲۰,۰۰۰ تومان\n"
+        "• جایزه برنده: ۱,۰۰۰,۰۰۰ تومان",
         reply_markup=get_main_menu()
     )
 

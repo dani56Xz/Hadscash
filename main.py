@@ -25,8 +25,9 @@ PRIZE_AMOUNT = 1000000  # 1,000,000 Toman
 # Database configuration
 DATABASE_URL = "postgresql://neondb_owner:npg_sAQj9gCK3wly@ep-winter-cherry-aezv1w77-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
-# Bot state
-BOT_ACTIVE = True
+# Global variables
+bot_enabled = True
+user_winning_numbers = {}
 
 # Logging setup
 logging.basicConfig(
@@ -63,29 +64,12 @@ async def init_db():
                     referrals INTEGER DEFAULT 0,
                     total_earned INTEGER DEFAULT 0,
                     total_spent INTEGER DEFAULT 0,
-                    last_active TIMESTAMP DEFAULT NOW(),
                     created_at TIMESTAMP DEFAULT NOW(),
-                    is_active BOOLEAN DEFAULT TRUE
+                    last_active TIMESTAMP DEFAULT NOW(),
+                    is_active BOOLEAN DEFAULT true
                 )
             ''')
-            
-            # Create bot_stats table if not exists
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS bot_stats (
-                    id SERIAL PRIMARY KEY,
-                    total_income INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT NOW()
-                )
-            ''')
-            
-            # Insert initial stats if not exists
-            await conn.execute('''
-                INSERT INTO bot_stats (id, total_income) 
-                VALUES (1, 0) 
-                ON CONFLICT (id) DO NOTHING
-            ''')
-            
-            logger.info("✅ Database tables created/verified")
+            logger.info("✅ Users table created/verified")
     except Exception as e:
         logger.error(f"❌ Database initialization error: {e}")
 
@@ -106,7 +90,7 @@ async def create_user(user_id: int, username: str):
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO users (user_id, username, last_active) VALUES ($1, $2, NOW()) ON CONFLICT (user_id) DO NOTHING",
+                "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
                 user_id, username
             )
             logger.info(f"✅ New user created: {user_id}")
@@ -127,31 +111,43 @@ async def update_user(user_id: int, **kwargs):
     except Exception as e:
         logger.error(f"❌ Error updating user {user_id}: {e}")
 
-async def update_bot_stats(income: int = 0):
-    """Update bot statistics"""
+async def update_user_activity(user_id: int):
+    """Update user last activity time"""
     try:
         async with db_pool.acquire() as conn:
-            if income > 0:
-                await conn.execute(
-                    "UPDATE bot_stats SET total_income = total_income + $1, updated_at = NOW() WHERE id = 1",
-                    income
-                )
-            logger.debug("✅ Bot stats updated")
+            await conn.execute(
+                "UPDATE users SET last_active = NOW() WHERE user_id = $1",
+                user_id
+            )
     except Exception as e:
-        logger.error(f"❌ Error updating bot stats: {e}")
+        logger.error(f"❌ Error updating user activity {user_id}: {e}")
 
 async def get_bot_stats():
     """Get bot statistics"""
     try:
         async with db_pool.acquire() as conn:
-            stats = await conn.fetchrow("SELECT * FROM bot_stats WHERE id = 1")
-            return dict(stats) if stats else None
+            # Total users
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            
+            # Active users in last 24 hours
+            active_users = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '24 hours'"
+            )
+            
+            # Total income (sum of total_spent)
+            total_income = await conn.fetchval("SELECT COALESCE(SUM(total_spent), 0) FROM users")
+            
+            return {
+                "total_users": total_users,
+                "active_users": active_users,
+                "total_income": total_income
+            }
     except Exception as e:
         logger.error(f"❌ Error getting bot stats: {e}")
-        return None
+        return {"total_users": 0, "active_users": 0, "total_income": 0}
 
 async def get_all_users():
-    """Get all users from database"""
+    """Get all users data"""
     try:
         async with db_pool.acquire() as conn:
             users = await conn.fetch("SELECT * FROM users ORDER BY created_at DESC")
@@ -160,18 +156,29 @@ async def get_all_users():
         logger.error(f"❌ Error getting all users: {e}")
         return []
 
-async def get_active_users_count(hours: int = 24):
-    """Get count of active users in last N hours"""
+async def backup_database():
+    """Create database backup"""
     try:
         async with db_pool.acquire() as conn:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '$1 hours'",
-                hours
-            )
-            return count
+            users_data = await conn.fetch("SELECT * FROM users ORDER BY user_id")
+            backup = {
+                "timestamp": datetime.now().isoformat(),
+                "users": [dict(user) for user in users_data]
+            }
+            return json.dumps(backup, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"❌ Error getting active users count: {e}")
-        return 0
+        logger.error(f"❌ Error creating database backup: {e}")
+        return None
+
+async def clear_database():
+    """Clear all user data"""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM users")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Error clearing database: {e}")
+        return False
 
 # Main menu keyboard
 def get_main_menu():
@@ -186,16 +193,6 @@ def get_main_menu():
 def get_balance_menu():
     keyboard = [
         ["💸 نمایش موجودی", "💳 افزایش موجودی"],
-        ["🔙 بازگشت به منو"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-# Admin menu keyboard
-def get_admin_menu():
-    keyboard = [
-        ["📊 آمار ربات", "💾 پشتیبان گیری"],
-        ["🧹 پاکسازی دیتابیس", "👥 اطلاعات کاربران"],
-        ["📢 ارسال اطلاعیه", "🔌 مدیریت بات"],
         ["🔙 بازگشت به منو"]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -230,50 +227,36 @@ async def toman_to_tron(toman):
     tron_amount = usd_amount / tron_price_usd
     return tron_amount + 1  # Add 1 TRX for transaction fee
 
-# Generate random winning number
-def generate_winning_number():
-    return random.randint(1, 1000)
+# Generate random winning number for user
+def generate_winning_number(user_id: int):
+    winning_number = random.randint(1, 1000)
+    user_winning_numbers[user_id] = winning_number
+    logger.info(f"🎯 Generated winning number {winning_number} for user {user_id}")
+    return winning_number
 
-# تابع برای بررسی وضعیت بات
-def is_bot_active():
-    return BOT_ACTIVE
+# Get winning number for user
+def get_winning_number(user_id: int):
+    if user_id not in user_winning_numbers:
+        return generate_winning_number(user_id)
+    return user_winning_numbers[user_id]
 
-# تابع برای تغییر وضعیت بات
-def set_bot_active(status: bool):
-    global BOT_ACTIVE
-    BOT_ACTIVE = status
-
-# تنظیم منوی همبرگری برای کاربران
-async def setup_bot_commands(application: Application):
-    """Setup bot commands for the menu button"""
-    # دستورات برای کاربران عادی
-    commands = [
-        ("start", "شروع بازی و منوی اصلی"),
-        ("profile", "مشاهده پروفایل"),
-        ("invite", "دعوت دوستان"),
-        ("balance", "مدیریت موجودی"),
-        ("help", "راهنمای ربات")
-    ]
-    
-    await application.bot.set_my_commands(commands)
-    
-    # دستورات اضافی برای ادمین
-    admin_commands = commands + [
-        ("stats", "آمار ربات (فقط ادمین)"),
-        ("backup", "پشتیبان گیری (فقط ادمین)"),
-        ("clear_db", "پاکسازی دیتابیس (فقط ادمین)"),
-        ("users", "اطلاعات کاربران (فقط ادمین)"),
-        ("broadcast", "ارسال اطلاعیه (فقط ادمین)"),
-        ("bot_control", "مدیریت بات (فقط ادمین)")
-    ]
-    
-    # تنظیم دستورات برای ادمین
-    await application.bot.set_my_commands(
-        admin_commands,
-        scope=telegram.BotCommandScopeChat(ADMIN_ID)
-    )
-    
-    logger.info("✅ Bot commands menu setup completed")
+# Setup menu button
+async def setup_menu_button():
+    try:
+        commands = [
+            ("start", "شروع بازی"),
+            ("stats", "آمار ربات (ادمین)"),
+            ("backup", "پشتیبان گیری (ادمین)"),
+            ("clear", "پاکسازی دیتابیس (ادمین)"),
+            ("users", "اطلاعات کاربران (ادمین)"),
+            ("broadcast", "ارسال اطلاعیه (ادمین)"),
+            ("toggle", "خاموش/روشن کردن ربات (ادمین)")
+        ]
+        
+        await application.bot.set_my_commands(commands)
+        logger.info("✅ Menu button commands set successfully")
+    except Exception as e:
+        logger.error(f"❌ Error setting menu button: {e}")
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -281,12 +264,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username or "Unknown"
     logger.info(f"🚀 Received /start from user {user_id} (@{username})")
     
-    # Update last active time
-    await update_user(user_id, last_active=datetime.now())
+    # Update user activity
+    await update_user_activity(user_id)
     
-    # Check if bot is active for regular users
-    if user_id != ADMIN_ID and not is_bot_active():
-        await update.message.reply_text("⏸️ ربات در حال حاضر غیرفعال است. لطفاً稍后 تلاش کنید.")
+    # Check if bot is enabled for regular users
+    if user_id != ADMIN_ID and not bot_enabled:
+        await update.message.reply_text("❌ ربات موقتاً غیرفعال شده است. لطفاً稍后 تلاش کنید.")
+        return
+    
+    # Check channel membership for regular users
+    if user_id != ADMIN_ID and not await check_membership(context.bot, user_id):
+        keyboard = [[InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/hadscash")]]
+        await update.message.reply_text(
+            "⚠️ لطفاً ابتدا در کانال @hadscash عضو شوید و سپس دوباره /start را بزنید!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info(f"❌ User {user_id} not in channel, prompted to join")
         return
     
     # Initialize user data if new
@@ -296,7 +289,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_user(user_id)
         logger.info(f"👤 New user initialized: {user_id}")
         
-        # Notify admin of new member (only for first time)
+        # Notify admin only for new users
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -305,7 +298,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"📢 Admin notified of new user {user_id}")
         except Exception as e:
             logger.error(f"❌ Error notifying admin: {e}")
-
+    
     # Check for referral
     args = context.args
     if args and args[0].isdigit():
@@ -323,412 +316,301 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 logger.info(f"🎁 Referral bonus added for {referrer_id} by {user_id}")
 
-    # Check channel membership for regular users
-    if user_id != ADMIN_ID and not await check_membership(context.bot, user_id):
-        keyboard = [[InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/hadscash")]]
-        await update.message.reply_text(
-            "⚠️ لطفاً ابتدا در کانال @hadscash عضو شوید و سپس دوباره /start را بزنید!",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        logger.info(f"❌ User {user_id} not in channel, prompted to join")
-        return
-
     # Welcome message
-    welcome_text = (
+    await update.message.reply_text(
         "🎮 به ربات حدس کَش خوش آمدید! ✨\n\n"
         "🎲 با حدس عدد درست (۱ تا ۱۰۰۰) می‌توانید درآمد کسب کنید! 💰\n\n"
         "🆓 هر هفته یک فرصت رایگان دارید!\n"
         "👥 با دعوت دوستان موجودی خود را افزایش دهید!\n"
-        "💳 با افزایش موجودی هم می‌توانید بازی کنید!"
+        "💳 با افزایش موجودی هم می‌توانید بازی کنید!",
+        reply_markup=get_main_menu()
     )
-    
-    if user_id == ADMIN_ID:
-        await update.message.reply_text(welcome_text, reply_markup=get_admin_menu())
-    else:
-        await update.message.reply_text(welcome_text, reply_markup=get_main_menu())
-    
     logger.info(f"👋 Welcome message sent to user {user_id}")
 
 # Admin command to show stats
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         logger.info(f"🚫 Unauthorized stats attempt by {user_id}")
         return
     
-    try:
-        # Get statistics
-        total_users = len(await get_all_users())
-        active_users = await get_active_users_count(24)
-        bot_stats = await get_bot_stats()
-        total_income = bot_stats["total_income"] if bot_stats else 0
-        
-        stats_text = (
-            f"📊 آمار کامل ربات:\n\n"
-            f"👥 تعداد کل کاربران: {total_users:,}\n"
-            f"🟢 کاربران فعال (24h): {active_users:,}\n"
-            f"💰 درآمد کل ربات: {total_income:,} تومان\n"
-            f"🔌 وضعیت بات: {'فعال' if is_bot_active() else 'غیرفعال'}"
-        )
-        
-        await update.message.reply_text(stats_text, reply_markup=get_admin_menu())
-        logger.info(f"📊 Stats shown to admin {user_id}")
-    except Exception as e:
-        logger.error(f"❌ Error showing stats: {e}")
-        await update.message.reply_text("❌ خطا در دریافت آمار")
-
-# Admin command to backup database
-async def backup_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
-        return
+    stats_data = await get_bot_stats()
     
-    try:
-        users = await get_all_users()
-        backup_data = {
-            "backup_time": datetime.now().isoformat(),
-            "total_users": len(users),
-            "users": users
-        }
-        
-        # Create backup file
-        backup_filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(backup_filename, 'w', encoding='utf-8') as f:
-            json.dump(backup_data, f, ensure_ascii=False, indent=2)
-        
-        # Send backup file
-        with open(backup_filename, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename=backup_filename,
-                caption="✅ پشتیبان گیری از دیتابیس انجام شد"
-            )
-        
-        # Clean up
-        os.remove(backup_filename)
-        logger.info(f"💾 Database backup created by admin {user_id}")
-        
-    except Exception as e:
-        logger.error(f"❌ Error creating backup: {e}")
-        await update.message.reply_text("❌ خطا در پشتیبان گیری")
-
-# Admin command to clear database
-async def clear_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
-        return
-    
-    try:
-        async with db_pool.acquire() as conn:
-            # Reset all user data but keep user records
-            await conn.execute('''
-                UPDATE users SET 
-                balance = 0,
-                guesses_left = 1,
-                referrals = 0,
-                total_earned = 0,
-                total_spent = 0,
-                last_free_guess = NOW(),
-                is_active = TRUE
-            ''')
-            
-            # Reset bot stats
-            await conn.execute("UPDATE bot_stats SET total_income = 0, updated_at = NOW() WHERE id = 1")
-        
-        await update.message.reply_text("✅ دیتابیس با موفقیت پاکسازی شد", reply_markup=get_admin_menu())
-        logger.info(f"🧹 Database cleared by admin {user_id}")
-        
-    except Exception as e:
-        logger.error(f"❌ Error clearing database: {e}")
-        await update.message.reply_text("❌ خطا در پاکسازی دیتابیس")
-
-# Admin command to get all users info
-async def get_users_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
-        return
-    
-    try:
-        users = await get_all_users()
-        if not users:
-            await update.message.reply_text("❌ هیچ کاربری یافت نشد")
-            return
-        
-        # Send in chunks to avoid message length limits
-        chunk_size = 10
-        for i in range(0, len(users), chunk_size):
-            chunk = users[i:i + chunk_size]
-            message = "👥 اطلاعات کاربران:\n\n"
-            
-            for user in chunk:
-                message += (
-                    f"👤 کاربر: @{user.get('username', 'بدون یوزرنیم')}\n"
-                    f"🆔 ID: {user['user_id']}\n"
-                    f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
-                    f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
-                    f"👥 دعوت‌ها: {user.get('referrals', 0)}\n"
-                    f"💵 درآمد کل: {user.get('total_earned', 0):,} تومان\n"
-                    f"💸 هزینه کل: {user.get('total_spent', 0):,} تومان\n"
-                    f"🕒 آخرین فعالیت: {user.get('last_active', 'نامشخص')}\n"
-                    f"📅 تاریخ عضویت: {user.get('created_at', 'نامشخص')}\n"
-                    f"────────────────────\n"
-                )
-            
-            await update.message.reply_text(message)
-        
-        logger.info(f"📋 Users info sent to admin {user_id}")
-        
-    except Exception as e:
-        logger.error(f"❌ Error getting users info: {e}")
-        await update.message.reply_text("❌ خطا در دریافت اطلاعات کاربران")
-
-# Admin command to broadcast message
-async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
-        return
-    
-    context.user_data["broadcasting"] = True
     await update.message.reply_text(
-        "📢 لطفاً پیام اطلاعیه را ارسال کنید:",
-        reply_markup=ReplyKeyboardMarkup([["❌ لغو"]], resize_keyboard=True)
+        f"📊 آمار کامل ربات:\n\n"
+        f"👥 تعداد کل کاربران: {stats_data['total_users']:,}\n"
+        f"🟢 کاربران فعال (24h): {stats_data['active_users']:,}\n"
+        f"💰 درآمد کل ربات: {stats_data['total_income']:,} تومان\n"
+        f"🔘 وضعیت ربات: {'🟢 روشن' if bot_enabled else '🔴 خاموش'}"
     )
 
-# Admin command to manage bot state
-async def bot_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Admin command to backup database
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
+        logger.info(f"🚫 Unauthorized backup attempt by {user_id}")
+        return
+    
+    await update.message.reply_text("⏳ در حال ایجاد پشتیبان از دیتابیس...")
+    
+    backup_data = await backup_database()
+    if backup_data:
+        # Send as file if too large
+        if len(backup_data) > 4000:
+            await update.message.reply_document(
+                document=backup_data.encode('utf-8'),
+                filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                caption="✅ پشتیبان دیتابیس"
+            )
+        else:
+            await update.message.reply_text(f"```json\n{backup_data}\n```", parse_mode="Markdown")
+        logger.info("✅ Database backup sent to admin")
+    else:
+        await update.message.reply_text("❌ خطا در ایجاد پشتیبان!")
+
+# Admin command to clear database
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        logger.info(f"🚫 Unauthorized clear attempt by {user_id}")
         return
     
     keyboard = [
-        ["✅ روشن کردن بات", "❌ خاموش کردن بات"],
-        ["🔙 بازگشت به منو"]
+        [InlineKeyboardButton("✅ بله", callback_data="clear_confirm"),
+         InlineKeyboardButton("❌ خیر", callback_data="clear_cancel")]
     ]
     
     await update.message.reply_text(
-        "🔌 مدیریت وضعیت بات:\n\n"
-        "می‌خواهید ربات را خاموش ❌ یا روشن ✅ کنید؟",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-
-# Profile command
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = await get_user(user_id)
-    
-    if user:
-        await update.message.reply_text(
-            f"👤 پروفایل شما:\n\n"
-            f"🆔 ID: {user_id}\n"
-            f"📛 نام کاربری: @{user.get('username', 'Unknown')}\n"
-            f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
-            f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
-            f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
-            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
-            f"💸 کل هزینه: {user.get('total_spent', 0):,} تومان",
-            reply_markup=get_main_menu()
-        )
-        logger.info(f"📊 Profile shown for {user_id}")
-    else:
-        await update.message.reply_text("⚠️ خطا در دریافت اطلاعات پروفایل!")
-
-# Invite command
-async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    referral_link = f"https://t.me/HadsCashBot?start={user_id}"
-    
-    keyboard = [[InlineKeyboardButton("🔗 لینک دعوت", url=referral_link)]]
-    
-    await update.message.reply_text(
-        f"📩 دعوت از دوستان\n\n"
-        f"👥 دوستان خود را دعوت کنید و به ازای هر نفر {REFERRAL_BONUS:,} تومان دریافت کنید! 💰\n\n"
-        f"🔗 لینک دعوت شما:\n{referral_link}\n\n"
-        f"📢 ربات حدس کَش:\n"
-        f"🎲 با حدس عدد درست درآمد کسب کنید!\n"
-        f"🆓 هر هفته یک فرصت رایگان!",
+        "⚠️ آیا مطمئن هستید که می‌خواهید تمام داده‌های کاربران را پاک کنید؟",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    logger.info(f"📤 Invite link sent to {user_id}")
 
-# Balance command
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Admin command to show all users
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = await get_user(user_id)
+    if user_id != ADMIN_ID:
+        logger.info(f"🚫 Unauthorized users attempt by {user_id}")
+        return
     
-    if user:
-        await update.message.reply_text(
-            f"💸 موجودی شما: {user.get('balance', 0):,} تومان 💰",
-            reply_markup=get_balance_menu()
-        )
-        logger.info(f"💰 Balance shown for {user_id}: {user.get('balance', 0)}")
-    else:
-        await update.message.reply_text("⚠️ خطا در دریافت موجودی!")
+    await update.message.reply_text("⏳ در حال دریافت اطلاعات کاربران...")
+    
+    all_users = await get_all_users()
+    if not all_users:
+        await update.message.reply_text("❌ هیچ کاربری یافت نشد!")
+        return
+    
+    # Send in chunks to avoid message limits
+    chunk_size = 20
+    for i in range(0, len(all_users), chunk_size):
+        chunk = all_users[i:i + chunk_size]
+        message = "👥 اطلاعات کاربران:\n\n"
+        
+        for user in chunk:
+            message += (
+                f"👤 @{user.get('username', 'بدون یوزرنیم')}\n"
+                f"🆔 ID: {user['user_id']}\n"
+                f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
+                f"🎯 شانس: {user.get('guesses_left', 0)}\n"
+                f"👥 دعوت‌ها: {user.get('referrals', 0)}\n"
+                f"💵 درآمد: {user.get('total_earned', 0):,} تومان\n"
+                f"💸 هزینه: {user.get('total_spent', 0):,} تومان\n"
+                f"🕒 عضویت: {user.get('created_at').strftime('%Y-%m-%d %H:%M')}\n"
+                f"🟢 آخرین فعالیت: {user.get('last_active').strftime('%Y-%m-%d %H:%M')}\n"
+                f"{'-' * 30}\n"
+            )
+        
+        try:
+            await update.message.reply_text(message)
+        except Exception as e:
+            logger.error(f"❌ Error sending users chunk: {e}")
+            await update.message.reply_text("❌ خطا در ارسال اطلاعات کاربران!")
 
-# Help command
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Admin command for broadcast
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        logger.info(f"🚫 Unauthorized broadcast attempt by {user_id}")
+        return
+    
+    context.user_data["broadcast_mode"] = True
     await update.message.reply_text(
-        "ℹ️ راهنمای ربات حدس کَش\n\n"
-        "🎮 نحوه بازی:\n"
-        "• عددی بین ۱ تا ۱۰۰۰ حدس بزنید\n"
-        "• اگر درست حدس بزنید، برنده جایزه می‌شوید\n\n"
-        "🆓 فرصت رایگان:\n"
-        "• هر هفته یک فرصت رایگان دارید\n"
-        "• پس از آن باید موجودی داشته باشید\n\n"
-        "💰 افزایش موجودی:\n"
-        "• دعوت دوستان (هر نفر ۵,۰۰۰ تومان)\n"
-        "• واریز ترون (حداقل ۲۰،۰۰۰ تومان)\n\n"
-        "👥 دعوت دوستان:\n"
-        "• به ازای هر دعوت: 5,000 تومان\n"
-        "• دوستان شما هم یک فرصت رایگان می‌گیرند\n\n"
-        "❓ سوالات متداول:\n"
-        "• هر کاربر هفته‌ای یک بار بصورت رایگان می‌تواند بازی کند\n"
-        "• حداقل موجودی برای بازی: ۲۰,۰۰۰ تومان\n"
-        "• جایزه برنده: ۱۰۰۰,۰۰۰ تومان",
-        reply_markup=get_main_menu()
+        "📢 لطفاً پیام اطلاعیه را ارسال کنید:"
     )
 
-# Handle callback queries for payment approval
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Admin command to toggle bot
+async def toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        logger.info(f"🚫 Unauthorized toggle attempt by {user_id}")
+        return
+    
+    global bot_enabled
+    keyboard = [
+        [InlineKeyboardButton("✅ روشن", callback_data="toggle_on"),
+         InlineKeyboardButton("❌ خاموش", callback_data="toggle_off")]
+    ]
+    
+    await update.message.reply_text(
+        f"🔘 وضعیت فعلی ربات: {'🟢 روشن' if bot_enabled else '🔴 خاموش'}\n\n"
+        "می‌خواهید ربات را خاموش❌ یا روشن✅ کنید؟",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# Handle callback queries
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    
     await query.answer()
     
-    data = query.data
-    user_id = int(data.split('_')[1])
-    action = data.split('_')[0]
-    
-    if action == "approve":
-        # Approve payment
-        amount = context.user_data.get(f"pending_{user_id}", {}).get("amount", 0)
-        if amount > 0:
-            user = await get_user(user_id)
+    # Handle payment approval
+    if data.startswith("approve_"):
+        payment_user_id = int(data.split("_")[1])
+        amount = int(data.split("_")[2])
+        
+        user = await get_user(payment_user_id)
+        if user:
             new_balance = user["balance"] + amount
-            await update_user(user_id, balance=new_balance)
+            new_total_spent = user.get("total_spent", 0) + amount
+            await update_user(payment_user_id, balance=new_balance, total_spent=new_total_spent)
             
-            # Update bot stats
-            await update_bot_stats(amount)
-            
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ پرداخت شما تأیید شد! {amount:,} تومان به موجودی شما اضافه شد. 💰"
+            await query.edit_message_text(
+                f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
+                f"💰 مبلغ: {amount:,} تومان\n"
+                f"💸 موجودی جدید: {new_balance:,} تومان"
             )
             
-            await query.edit_message_caption(
-                f"✅ پرداخت تأیید شد!\n👤 کاربر: @{user.get('username', 'Unknown')}\n💰 مبلغ: {amount:,} تومان"
-            )
-            
-            logger.info(f"✅ Payment approved for user {user_id}: {amount} Toman")
-            
-    elif action == "reject":
-        # Reject payment
-        user = await get_user(user_id)
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="❌ پرداخت شما رد شد. لطفاً با پشتیبانی تماس بگیرید."
-        )
-        
-        await query.edit_message_caption(
-            f"❌ پرداخت رد شد!\n👤 کاربر: @{user.get('username', 'Unknown')}"
-        )
-        
-        logger.info(f"❌ Payment rejected for user {user_id}")
+            # Notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=payment_user_id,
+                    text=f"✅ پرداخت شما تأیید شد!\n\n💰 مبلغ {amount:,} تومان به موجودی شما اضافه شد.\n💸 موجودی جدید: {new_balance:,} تومان",
+                    reply_markup=get_main_menu()
+                )
+            except Exception as e:
+                logger.error(f"❌ Error notifying user of payment approval: {e}")
+                
+        else:
+            await query.edit_message_text("❌ کاربر یافت نشد!")
     
-    # Clean up
-    if f"pending_{user_id}" in context.user_data:
-        del context.user_data[f"pending_{user_id}"]
+    # Handle payment rejection
+    elif data.startswith("reject_"):
+        payment_user_id = int(data.split("_")[1])
+        
+        user = await get_user(payment_user_id)
+        await query.edit_message_text(
+            f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
+        )
+        
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=payment_user_id,
+                text="❌ پرداخت شما رد شد!\n\n📞 لطفاً با پشتیبانی تماس بگیرید.",
+                reply_markup=get_main_menu()
+            )
+        except Exception as e:
+            logger.error(f"❌ Error notifying user of payment rejection: {e}")
+    
+    # Handle database clear confirmation
+    elif data == "clear_confirm":
+        if await clear_database():
+            await query.edit_message_text("✅ دیتابیس با موفقیت پاک شد!")
+        else:
+            await query.edit_message_text("❌ خطا در پاکسازی دیتابیس!")
+    
+    elif data == "clear_cancel":
+        await query.edit_message_text("❌ پاکسازی دیتابیس لغو شد.")
+    
+    # Handle bot toggle
+    elif data == "toggle_on":
+        global bot_enabled
+        bot_enabled = True
+        await query.edit_message_text("✅ ربات روشن شد!")
+    
+    elif data == "toggle_off":
+        bot_enabled = False
+        await query.edit_message_text("🔴 ربات خاموش شد!")
+    
+    # Handle broadcast confirmation
+    elif data == "broadcast_confirm":
+        broadcast_message = context.user_data.get("broadcast_message")
+        if broadcast_message:
+            all_users = await get_all_users()
+            success_count = 0
+            fail_count = 0
+            
+            for user in all_users:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user["user_id"],
+                        text=f"📢 اطلاعیه:\n\n{broadcast_message}"
+                    )
+                    success_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    logger.error(f"❌ Error sending broadcast to {user['user_id']}: {e}")
+            
+            await query.edit_message_text(
+                f"📊 نتیجه ارسال اطلاعیه:\n\n"
+                f"✅ موفق: {success_count}\n"
+                f"❌ ناموفق: {fail_count}"
+            )
+        else:
+            await query.edit_message_text("❌ پیام اطلاعیه یافت نشد!")
+        
+        context.user_data["broadcast_mode"] = False
+    
+    elif data == "broadcast_cancel":
+        await query.edit_message_text("❌ ارسال اطلاعیه لغو شد.")
+        context.user_data["broadcast_mode"] = False
 
 # Handle text messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
+    state = context.user_data.get("state")
     
-    # Update last active time
-    await update_user(user_id, last_active=datetime.now())
+    logger.info(f"📩 Message received from {user_id}: '{text}' in state: {state}")
     
-    # Check if bot is active for regular users
-    if user_id != ADMIN_ID and not is_bot_active():
-        await update.message.reply_text("⏸️ ربات در حال حاضر غیرفعال است. لطفاً稍后 تلاش کنید.")
+    # Update user activity
+    await update_user_activity(user_id)
+    
+    # Check if bot is enabled for regular users
+    if user_id != ADMIN_ID and not bot_enabled:
+        await update.message.reply_text("❌ ربات موقتاً غیرفعال شده است. لطفاً稍后 تلاش کنید.")
         return
     
-    # Check channel membership for regular users
+    # Check channel membership for regular users for all actions
     if user_id != ADMIN_ID and not await check_membership(context.bot, user_id):
         keyboard = [[InlineKeyboardButton("📢 عضویت در کانال", url="https://t.me/hadscash")]]
         await update.message.reply_text(
-            "⚠️ لطفاً ابتدا در کانال @hadscash عضو شوید و سپس از منوی اصلی استفاده کنید!",
+            "⚠️ لطفاً ابتدا در کانال @hadscash عضو شوید و سپس از ربات استفاده کنید!",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-
-    state = context.user_data.get("state")
-    logger.info(f"📩 Message received from {user_id}: '{text}' in state: {state}")
-
-    # Handle admin menu options
-    if user_id == ADMIN_ID:
-        if text == "📊 آمار ربات":
-            await stats(update, context)
-            return
-        elif text == "💾 پشتیبان گیری":
-            await backup_database(update, context)
-            return
-        elif text == "🧹 پاکسازی دیتابیس":
-            await clear_database(update, context)
-            return
-        elif text == "👥 اطلاعات کاربران":
-            await get_users_info(update, context)
-            return
-        elif text == "📢 ارسال اطلاعیه":
-            await broadcast_message(update, context)
-            return
-        elif text == "🔌 مدیریت بات":
-            await bot_control(update, context)
-            return
-        elif text == "✅ روشن کردن بات":
-            set_bot_active(True)
-            await update.message.reply_text("✅ ربات روشن شد!", reply_markup=get_admin_menu())
-            return
-        elif text == "❌ خاموش کردن بات":
-            set_bot_active(False)
-            await update.message.reply_text("❌ ربات خاموش شد!", reply_markup=get_admin_menu())
-            return
-        elif text == "❌ لغو" and context.user_data.get("broadcasting"):
-            context.user_data["broadcasting"] = False
-            await update.message.reply_text("✅ ارسال اطلاعیه لغو شد", reply_markup=get_admin_menu())
-            return
-
-    # Handle broadcasting state
-    if context.user_data.get("broadcasting") and user_id == ADMIN_ID:
-        users = await get_all_users()
-        success_count = 0
-        
-        for user in users:
-            try:
-                await context.bot.send_message(
-                    chat_id=user["user_id"],
-                    text=f"📢 اطلاعیه:\n\n{text}"
-                )
-                success_count += 1
-            except Exception as e:
-                logger.error(f"❌ Error sending broadcast to {user['user_id']}: {e}")
-        
-        context.user_data["broadcasting"] = False
+    
+    # Handle broadcast mode for admin
+    if context.user_data.get("broadcast_mode") and user_id == ADMIN_ID:
+        context.user_data["broadcast_message"] = text
+        keyboard = [
+            [InlineKeyboardButton("✅ بله", callback_data="broadcast_confirm"),
+             InlineKeyboardButton("❌ خیر", callback_data="broadcast_cancel")]
+        ]
         await update.message.reply_text(
-            f"✅ اطلاعیه به {success_count} کاربر ارسال شد",
-            reply_markup=get_admin_menu()
+            f"📢 آیا می‌خواهید این پیام را برای همه کاربران ارسال کنید؟\n\n{text}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
-
-    # Handle main menu options for all users
+    
+    # Handle main menu options
     if text == "🎮 شروع بازی":
         await start_game(update, context)
         return
         
     elif text == "👤 پروفایل":
-        await profile(update, context)
+        await show_profile(update, context)
         return
         
     elif text == "📩 دعوت دوستان":
@@ -748,10 +630,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     elif text == "🔙 بازگشت به منو":
-        if user_id == ADMIN_ID:
-            await update.message.reply_text("🔙 بازگشت به منوی اصلی:", reply_markup=get_admin_menu())
-        else:
-            await update.message.reply_text("🔙 بازگشت به منوی اصلی:", reply_markup=get_main_menu())
+        await update.message.reply_text("🔙 بازگشت به منوی اصلی:", reply_markup=get_main_menu())
         return
         
     elif text == "ℹ️ راهنما":
@@ -799,6 +678,9 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"🎲 User {user_id} has no guesses or balance")
         return
 
+    # Generate winning number for this user session
+    generate_winning_number(user_id)
+    
     await update.message.reply_text(
         "🎲 یک عدد بین ۱ تا ۱۰۰۰ حدس بزنید:\n\n"
         "💡 نکته: عدد باید بین ۱ تا ۱۰۰۰ باشد",
@@ -823,9 +705,9 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ لطفاً یک عدد بین ۱ تا ۱۰۰۰ وارد کنید! 🔢")
             logger.info(f"❌ Invalid guess by {user_id}: {guess}")
             return
-        
-        # Generate winning number for this guess
-        winning_number = generate_winning_number()
+            
+        # Get winning number for this user
+        winning_number = get_winning_number(user_id)
             
         # Use free guess or deduct balance
         if user["guesses_left"] > 0:
@@ -854,7 +736,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=f"🏆 برنده جدید!\n\n"
-                         f"👤 کاربر: @{user.get('username', 'Unknown')}\n"
+                         f"👤 @{user.get('username', 'Unknown')}\n"
                          f"🆔 ID: {user_id}\n"
                          f"💰 جایزه: {PRIZE_AMOUNT:,} تومان\n"
                          f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
@@ -867,7 +749,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         else:
             await update.message.reply_text(
-                f"❌ اشتباه حدس زدید!\n\n"
+                f"❌ اشتباه بود!\n\n"
                 f"💔 شانس شما تمام شد.\n"
                 f"برای ادامه:\n"
                 f"👥 دوستان خود را دعوت کنید\n"
@@ -896,8 +778,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
             f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
             f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
-            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
-            f"💸 کل هزینه: {user.get('total_spent', 0):,} تومان",
+            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان",
             reply_markup=get_main_menu()
         )
         logger.info(f"📊 Profile shown for {user_id}")
@@ -909,8 +790,6 @@ async def invite_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     referral_link = f"https://t.me/HadsCashBot?start={user_id}"
     
-    keyboard = [[InlineKeyboardButton("🔗 لینک دعوت", url=referral_link)]]
-    
     await update.message.reply_text(
         f"📩 دعوت از دوستان\n\n"
         f"👥 دوستان خود را دعوت کنید و به ازای هر نفر {REFERRAL_BONUS:,} تومان دریافت کنید! 💰\n\n"
@@ -918,7 +797,7 @@ async def invite_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 ربات حدس کَش:\n"
         f"🎲 با حدس عدد درست درآمد کسب کنید!\n"
         f"🆓 هر هفته یک فرصت رایگان!",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=get_main_menu()
     )
     logger.info(f"📤 Invite link sent to {user_id}")
 
@@ -994,17 +873,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = context.user_data.get("amount", 0)
         tron_amount = context.user_data.get("tron_amount", 0)
         
-        # Store pending payment info
-        context.user_data[f"pending_{user_id}"] = {
-            "amount": amount,
-            "tron_amount": tron_amount,
-            "username": user.get("username", "Unknown")
-        }
-        
         # Forward screenshot to admin with approve/reject buttons
         keyboard = [
             [
-                InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{user_id}"),
+                InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{user_id}_{amount}"),
                 InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}")
             ]
         ]
@@ -1051,12 +923,12 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• دعوت دوستان (هر نفر ۵,۰۰۰ تومان)\n"
         "• واریز ترون (حداقل ۲۰،۰۰۰ تومان)\n\n"
         "👥 دعوت دوستان:\n"
-        "• به ازای هر دعوت: 5,000 تومان\n"
+        f"• به ازای هر دعوت: 5,000 تومان\n"
         "• دوستان شما هم یک فرصت رایگان می‌گیرند\n\n"
         "❓ سوالات متداول:\n"
         "• هر کاربر هفته‌ای یک بار بصورت رایگان می‌تواند بازی کند\n"
         "• حداقل موجودی برای بازی: ۲۰,۰۰۰ تومان\n"
-        "• جایزه برنده: ۱۰۰۰,۰۰۰ تومان",
+        "• جایزه برنده: ۱,۰۰۰,۰۰۰ تومان",
         reply_markup=get_main_menu()
     )
 
@@ -1085,11 +957,11 @@ async def on_startup():
         await application.bot.set_webhook(url=WEBHOOK_URL, max_connections=40)
         logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
         
+        # Setup menu button
+        await setup_menu_button()
+        
         # Initialize application without starting polling
         await application.initialize()
-        
-        # Setup bot commands menu
-        await setup_bot_commands(application)
         
         # Start the application without updater for webhook mode
         await application.start()
@@ -1119,16 +991,12 @@ async def on_shutdown():
 # Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("stats", stats))
-application.add_handler(CommandHandler("backup", backup_database))
-application.add_handler(CommandHandler("clear_db", clear_database))
-application.add_handler(CommandHandler("users", get_users_info))
-application.add_handler(CommandHandler("broadcast", broadcast_message))
-application.add_handler(CommandHandler("bot_control", bot_control))
-application.add_handler(CommandHandler("profile", profile))
-application.add_handler(CommandHandler("invite", invite))
-application.add_handler(CommandHandler("balance", balance))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CallbackQueryHandler(handle_callback_query))
+application.add_handler(CommandHandler("backup", backup))
+application.add_handler(CommandHandler("clear", clear))
+application.add_handler(CommandHandler("users", users))
+application.add_handler(CommandHandler("broadcast", broadcast))
+application.add_handler(CommandHandler("toggle", toggle))
+application.add_handler(CallbackQueryHandler(handle_callback))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 

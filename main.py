@@ -6,7 +6,7 @@ import random
 import json
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, BotCommandScopeChat
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 )
@@ -65,6 +65,7 @@ async def init_db():
                     referrals INTEGER DEFAULT 0,
                     total_earned INTEGER DEFAULT 0,
                     total_spent INTEGER DEFAULT 0,
+                    total_deposited INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT NOW(),
                     last_active TIMESTAMP DEFAULT NOW(),
                     is_active BOOLEAN DEFAULT true
@@ -135,8 +136,8 @@ async def get_bot_stats():
                 "SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '24 hours'"
             )
             
-            # Total income (sum of total_spent)
-            total_income = await conn.fetchval("SELECT COALESCE(SUM(total_spent), 0) FROM users")
+            # Total income (sum of total_deposited)
+            total_income = await conn.fetchval("SELECT COALESCE(SUM(total_deposited), 0) FROM users")
             
             # Total referred users
             total_referred = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
@@ -222,7 +223,7 @@ async def get_tron_price():
                 return data["tron"]["irr"]
     except Exception as e:
         logger.error(f"❌ Error fetching TRON price: {e}")
-        return 4200  # Fallback price in IRR (approx 0.1 USD * 42000 IRR/USD)
+        return 96000  # Updated fallback price in IRR (approx current value)
 
 # Convert Toman to TRON with fee consideration
 async def toman_to_tron(toman):
@@ -243,18 +244,6 @@ def get_winning_number(user_id: int):
     if user_id not in user_winning_numbers:
         return generate_winning_number(user_id)
     return user_winning_numbers[user_id]
-
-# Setup menu button
-async def setup_menu_button():
-    try:
-        commands = [
-            ("start", "شروع بازی")
-        ]
-        
-        await application.bot.set_my_commands(commands)
-        logger.info("✅ Menu button commands set successfully")
-    except Exception as e:
-        logger.error(f"❌ Error setting menu button: {e}")
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +307,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"📢 Admin notified of new user {user_id}")
         except Exception as e:
             logger.error(f"❌ Error notifying admin: {e}")
+    
+    # Set menu commands based on user
+    scope = BotCommandScopeChat(chat_id=user_id)
+    if user_id == ADMIN_ID:
+        commands = [
+            ("start", "شروع بازی"),
+            ("stats", "آمار ربات"),
+            ("backup", "پشتیبان گیری"),
+            ("clear", "پاکسازی دیتابیس"),
+            ("users", "اطلاعات کاربران"),
+            ("broadcast", "ارسال اطلاعیه"),
+            ("toggle", "خاموش/روشن کردن ربات")
+        ]
+    else:
+        commands = [
+            ("start", "شروع بازی")
+        ]
+    await context.bot.set_my_commands(commands, scope=scope)
     
     # Welcome message
     await update.message.reply_text(
@@ -476,7 +483,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = await get_user(payment_user_id)
         if user:
             new_balance = user["balance"] + amount
-            await update_user(payment_user_id, balance=new_balance)
+            new_total_deposited = user.get("total_deposited", 0) + amount
+            await update_user(payment_user_id, balance=new_balance, total_deposited=new_total_deposited)
             
             await query.edit_message_text(
                 f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
@@ -594,6 +602,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # Handle back to menu in any state
+    if text == "🔙 بازگشت به منو":
+        context.user_data["state"] = None
+        await update.message.reply_text("🔙 بازگشت به منوی اصلی:", reply_markup=get_main_menu())
+        return
+    
     # Handle broadcast mode for admin
     if context.user_data.get("broadcast_mode") and user_id == ADMIN_ID:
         context.user_data["broadcast_message"] = text
@@ -630,10 +644,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif text == "💳 افزایش موجودی":
         await increase_balance_prompt(update, context)
-        return
-        
-    elif text == "🔙 بازگشت به منو":
-        await update.message.reply_text("🔙 بازگشت به منوی اصلی:", reply_markup=get_main_menu())
         return
         
     elif text == "ℹ️ راهنما":
@@ -959,9 +969,6 @@ async def on_startup():
         await init_db()
         await application.bot.set_webhook(url=WEBHOOK_URL, max_connections=40)
         logger.info(f"✅ Webhook set: {WEBHOOK_URL}")
-        
-        # Setup menu button
-        await setup_menu_button()
         
         # Initialize application without starting polling
         await application.initialize()

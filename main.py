@@ -6,7 +6,7 @@ import random
 import json
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, MenuButtonCommands
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 )
@@ -25,7 +25,7 @@ PRIZE_AMOUNT = 1000000  # 1,000,000 Toman
 # Database configuration
 DATABASE_URL = "postgresql://neondb_owner:npg_sAQj9gCK3wly@ep-winter-cherry-aezv1w77-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
-# Bot state - تعریف متغیر global در اینجا
+# Bot state
 BOT_ACTIVE = True
 
 # Logging setup
@@ -243,6 +243,38 @@ def set_bot_active(status: bool):
     global BOT_ACTIVE
     BOT_ACTIVE = status
 
+# تنظیم منوی همبرگری برای کاربران
+async def setup_bot_commands(application: Application):
+    """Setup bot commands for the menu button"""
+    # دستورات برای کاربران عادی
+    commands = [
+        ("start", "شروع بازی و منوی اصلی"),
+        ("profile", "مشاهده پروفایل"),
+        ("invite", "دعوت دوستان"),
+        ("balance", "مدیریت موجودی"),
+        ("help", "راهنمای ربات")
+    ]
+    
+    await application.bot.set_my_commands(commands)
+    
+    # دستورات اضافی برای ادمین
+    admin_commands = commands + [
+        ("stats", "آمار ربات (فقط ادمین)"),
+        ("backup", "پشتیبان گیری (فقط ادمین)"),
+        ("clear_db", "پاکسازی دیتابیس (فقط ادمین)"),
+        ("users", "اطلاعات کاربران (فقط ادمین)"),
+        ("broadcast", "ارسال اطلاعیه (فقط ادمین)"),
+        ("bot_control", "مدیریت بات (فقط ادمین)")
+    ]
+    
+    # تنظیم دستورات برای ادمین
+    await application.bot.set_my_commands(
+        admin_commands,
+        scope=telegram.BotCommandScopeChat(ADMIN_ID)
+    )
+    
+    logger.info("✅ Bot commands menu setup completed")
+
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -321,6 +353,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         logger.info(f"🚫 Unauthorized stats attempt by {user_id}")
         return
     
@@ -349,6 +382,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         return
     
     try:
@@ -384,6 +418,7 @@ async def backup_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         return
     
     try:
@@ -414,6 +449,7 @@ async def clear_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_users_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         return
     
     try:
@@ -454,6 +490,7 @@ async def get_users_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         return
     
     context.user_data["broadcasting"] = True
@@ -463,9 +500,10 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # Admin command to manage bot state
-async def manage_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bot_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمین قابل دسترسی است!")
         return
     
     keyboard = [
@@ -477,6 +515,82 @@ async def manage_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔌 مدیریت وضعیت بات:\n\n"
         "می‌خواهید ربات را خاموش ❌ یا روشن ✅ کنید؟",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+
+# Profile command
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    
+    if user:
+        await update.message.reply_text(
+            f"👤 پروفایل شما:\n\n"
+            f"🆔 ID: {user_id}\n"
+            f"📛 نام کاربری: @{user.get('username', 'Unknown')}\n"
+            f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
+            f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
+            f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
+            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
+            f"💸 کل هزینه: {user.get('total_spent', 0):,} تومان",
+            reply_markup=get_main_menu()
+        )
+        logger.info(f"📊 Profile shown for {user_id}")
+    else:
+        await update.message.reply_text("⚠️ خطا در دریافت اطلاعات پروفایل!")
+
+# Invite command
+async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    referral_link = f"https://t.me/HadsCashBot?start={user_id}"
+    
+    keyboard = [[InlineKeyboardButton("🔗 لینک دعوت", url=referral_link)]]
+    
+    await update.message.reply_text(
+        f"📩 دعوت از دوستان\n\n"
+        f"👥 دوستان خود را دعوت کنید و به ازای هر نفر {REFERRAL_BONUS:,} تومان دریافت کنید! 💰\n\n"
+        f"🔗 لینک دعوت شما:\n{referral_link}\n\n"
+        f"📢 ربات حدس کَش:\n"
+        f"🎲 با حدس عدد درست درآمد کسب کنید!\n"
+        f"🆓 هر هفته یک فرصت رایگان!",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    logger.info(f"📤 Invite link sent to {user_id}")
+
+# Balance command
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = await get_user(user_id)
+    
+    if user:
+        await update.message.reply_text(
+            f"💸 موجودی شما: {user.get('balance', 0):,} تومان 💰",
+            reply_markup=get_balance_menu()
+        )
+        logger.info(f"💰 Balance shown for {user_id}: {user.get('balance', 0)}")
+    else:
+        await update.message.reply_text("⚠️ خطا در دریافت موجودی!")
+
+# Help command
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "ℹ️ راهنمای ربات حدس کَش\n\n"
+        "🎮 نحوه بازی:\n"
+        "• عددی بین ۱ تا ۱۰۰۰ حدس بزنید\n"
+        "• اگر درست حدس بزنید، برنده جایزه می‌شوید\n\n"
+        "🆓 فرصت رایگان:\n"
+        "• هر هفته یک فرصت رایگان دارید\n"
+        "• پس از آن باید موجودی داشته باشید\n\n"
+        "💰 افزایش موجودی:\n"
+        "• دعوت دوستان (هر نفر ۵,۰۰۰ تومان)\n"
+        "• واریز ترون (حداقل ۲۰،۰۰۰ تومان)\n\n"
+        "👥 دعوت دوستان:\n"
+        "• به ازای هر دعوت: 5,000 تومان\n"
+        "• دوستان شما هم یک فرصت رایگان می‌گیرند\n\n"
+        "❓ سوالات متداول:\n"
+        "• هر کاربر هفته‌ای یک بار بصورت رایگان می‌تواند بازی کند\n"
+        "• حداقل موجودی برای بازی: ۲۰,۰۰۰ تومان\n"
+        "• جایزه برنده: ۱۰۰۰,۰۰۰ تومان",
+        reply_markup=get_main_menu()
     )
 
 # Handle callback queries for payment approval
@@ -571,7 +685,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await broadcast_message(update, context)
             return
         elif text == "🔌 مدیریت بات":
-            await manage_bot(update, context)
+            await bot_control(update, context)
             return
         elif text == "✅ روشن کردن بات":
             set_bot_active(True)
@@ -614,7 +728,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     elif text == "👤 پروفایل":
-        await show_profile(update, context)
+        await profile(update, context)
         return
         
     elif text == "📩 دعوت دوستان":
@@ -974,6 +1088,9 @@ async def on_startup():
         # Initialize application without starting polling
         await application.initialize()
         
+        # Setup bot commands menu
+        await setup_bot_commands(application)
+        
         # Start the application without updater for webhook mode
         await application.start()
         logger.info("✅ Application started successfully")
@@ -1002,6 +1119,15 @@ async def on_shutdown():
 # Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("stats", stats))
+application.add_handler(CommandHandler("backup", backup_database))
+application.add_handler(CommandHandler("clear_db", clear_database))
+application.add_handler(CommandHandler("users", get_users_info))
+application.add_handler(CommandHandler("broadcast", broadcast_message))
+application.add_handler(CommandHandler("bot_control", bot_control))
+application.add_handler(CommandHandler("profile", profile))
+application.add_handler(CommandHandler("invite", invite))
+application.add_handler(CommandHandler("balance", balance))
+application.add_handler(CommandHandler("help", help_command))
 application.add_handler(CallbackQueryHandler(handle_callback_query))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))

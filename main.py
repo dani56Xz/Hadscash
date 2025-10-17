@@ -25,7 +25,7 @@ PRIZE_AMOUNT = 1000000  # 1,000,000 Toman
 # Database configuration
 DATABASE_URL = "postgresql://neondb_owner:npg_sAQj9gCK3wly@ep-winter-cherry-aezv1w77-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
-# Bot state
+# Bot state - تعریف متغیر global در اینجا
 BOT_ACTIVE = True
 
 # Logging setup
@@ -565,11 +565,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manage_bot(update, context)
             return
         elif text == "✅ روشن کردن بات":
+            # استفاده از global برای تغییر متغیر
             global BOT_ACTIVE
             BOT_ACTIVE = True
             await update.message.reply_text("✅ ربات روشن شد!", reply_markup=get_admin_menu())
             return
         elif text == "❌ خاموش کردن بات":
+            # استفاده از global برای تغییر متغیر
+            global BOT_ACTIVE
             BOT_ACTIVE = False
             await update.message.reply_text("❌ ربات خاموش شد!", reply_markup=get_admin_menu())
             return

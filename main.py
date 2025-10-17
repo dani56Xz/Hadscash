@@ -223,7 +223,7 @@ async def get_tron_price():
                 return data["tron"]["irr"]
     except Exception as e:
         logger.error(f"❌ Error fetching TRON price: {e}")
-        return 96000  # Updated fallback price in IRR (approx current value)
+        return 6720  # Fallback price in IRR (approx 0.16 USD * 42000 IRR/USD)
 
 # Convert Toman to TRON with fee consideration
 async def toman_to_tron(toman):
@@ -486,8 +486,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_total_deposited = user.get("total_deposited", 0) + amount
             await update_user(payment_user_id, balance=new_balance, total_deposited=new_total_deposited)
             
-            await query.edit_message_text(
-                f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
+            await query.edit_message_caption(
+                caption=f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
                 f"💰 مبلغ: {amount:,} تومان\n"
                 f"💸 موجودی جدید: {new_balance:,} تومان"
             )
@@ -503,15 +503,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"❌ Error notifying user of payment approval: {e}")
                 
         else:
-            await query.edit_message_text("❌ کاربر یافت نشد!")
+            await query.edit_message_caption(caption="❌ کاربر یافت نشد!")
     
     # Handle payment rejection
     elif data.startswith("reject_"):
         payment_user_id = int(data.split("_")[1])
         
         user = await get_user(payment_user_id)
-        await query.edit_message_text(
-            f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
+        await query.edit_message_caption(
+            caption=f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
         )
         
         # Notify user
@@ -658,6 +658,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state == "increase_balance":
         await handle_balance_increase(update, context)
         return
+
+    # Default response for unknown text
+    await update.message.reply_text("لطفاً از گزینه‌های منو استفاده کنید.", reply_markup=get_main_menu())
 
 # Start game handler
 async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):

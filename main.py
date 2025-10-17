@@ -87,22 +87,15 @@ async def get_user(user_id: int):
         logger.error(f"❌ Error getting user {user_id}: {e}")
         return None
 
-async def create_user(user_id: int, username: str, referrer_id: int = None):
+async def create_user(user_id: int, username: str):
     """Create new user in database"""
     try:
         async with db_pool.acquire() as conn:
-            if referrer_id:
-                await conn.execute(
-                    "INSERT INTO users (user_id, username, referrer_id, balance, guesses_left) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id) DO NOTHING",
-                    user_id, username, referrer_id, 0, 1
-                )
-                logger.info(f"✅ New user created with referrer: {user_id} referred by {referrer_id}")
-            else:
-                await conn.execute(
-                    "INSERT INTO users (user_id, username, balance, guesses_left) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO NOTHING",
-                    user_id, username, 0, 1
-                )
-                logger.info(f"✅ New user created: {user_id}")
+            await conn.execute(
+                "INSERT INTO users (user_id, username, balance, guesses_left) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO NOTHING",
+                user_id, username, 0, 1
+            )
+            logger.info(f"✅ New user created: {user_id}")
     except Exception as e:
         logger.error(f"❌ Error creating user {user_id}: {e}")
 
@@ -138,6 +131,9 @@ async def get_bot_stats():
             # Total users
             total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
             
+            # New users in last 24 hours
+            new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+            
             # Active users in last 24 hours
             active_users = await conn.fetchval(
                 "SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '24 hours'"
@@ -149,34 +145,16 @@ async def get_bot_stats():
             # Total referred users
             total_referred = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
             
-            # New users today
-            new_users_today = await conn.fetchval(
-                "SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'"
-            )
-            
-            # New users this week
-            new_users_week = await conn.fetchval(
-                "SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'"
-            )
-            
             return {
                 "total_users": total_users,
+                "new_users": new_users,
                 "active_users": active_users,
                 "total_income": total_income,
-                "total_referred": total_referred,
-                "new_users_today": new_users_today,
-                "new_users_week": new_users_week
+                "total_referred": total_referred
             }
     except Exception as e:
         logger.error(f"❌ Error getting bot stats: {e}")
-        return {
-            "total_users": 0, 
-            "active_users": 0, 
-            "total_income": 0, 
-            "total_referred": 0,
-            "new_users_today": 0,
-            "new_users_week": 0
-        }
+        return {"total_users": 0, "new_users": 0, "active_users": 0, "total_income": 0, "total_referred": 0}
 
 async def get_all_users():
     """Get all users data"""
@@ -288,38 +266,6 @@ async def refresh_free_guess(user_id: int):
         await update_user(user_id, guesses_left=1, last_free_guess=now)
         logger.info(f"🆓 Free guess reset for {user_id}")
 
-async def handle_referral(user_id: int, referrer_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Handle referral logic"""
-    try:
-        if referrer_id == user_id:
-            logger.info(f"⚠️ User {user_id} tried to refer themselves")
-            return
-            
-        referrer = await get_user(referrer_id)
-        if referrer:
-            # Update referrer's balance and referrals count
-            new_balance = referrer["balance"] + REFERRAL_BONUS
-            new_referrals = referrer["referrals"] + 1
-            await update_user(referrer_id, balance=new_balance, referrals=new_referrals)
-            
-            # Send notification to referrer
-            try:
-                await context.bot.send_message(
-                    chat_id=referrer_id,
-                    text=f"🎉 یک نفر با لینک دعوت شما عضو شد!\n💰 {REFERRAL_BONUS:,} تومان به موجودی شما اضافه شد!\n💸 موجودی جدید: {new_balance:,} تومان"
-                )
-                logger.info(f"🎁 Referral bonus added for {referrer_id} by {user_id}")
-            except Exception as e:
-                logger.error(f"❌ Error notifying referrer {referrer_id}: {e}")
-            
-            # Set referrer for new user
-            await update_user(user_id, referrer_id=referrer_id)
-            logger.info(f"✅ Referrer {referrer_id} set for user {user_id}")
-        else:
-            logger.warning(f"⚠️ Referrer {referrer_id} not found for user {user_id}")
-    except Exception as e:
-        logger.error(f"❌ Error handling referral for user {user_id}: {e}")
-
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -347,36 +293,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Initialize user data if new
     user = await get_user(user_id)
     was_new = False
-    
-    # Check for referral
-    referrer_id = None
-    args = context.args
-    if args and args[0].isdigit():
-        referrer_id = int(args[0])
-    
     if not user:
         was_new = True
-        await create_user(user_id, username, referrer_id)
+        await create_user(user_id, username)
         user = await get_user(user_id)
         logger.info(f"👤 New user initialized: {user_id}")
         
-        # Handle referral for new users
-        if referrer_id and referrer_id != user_id:
-            await handle_referral(user_id, referrer_id, context)
+        # Check for referral only for new users
+        args = context.args
+        if args and args[0].isdigit():
+            referrer_id = int(args[0])
+            if referrer_id != user_id:
+                referrer = await get_user(referrer_id)
+                if referrer:
+                    new_balance = referrer["balance"] + REFERRAL_BONUS
+                    new_referrals = referrer["referrals"] + 1
+                    await update_user(referrer_id, balance=new_balance, referrals=new_referrals)
+                    
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=f"🎉 یک نفر با لینک دعوت شما عضو شد! {REFERRAL_BONUS:,} تومان به موجودی شما اضافه شد. 💰"
+                    )
+                    logger.info(f"🎁 Referral bonus added for {referrer_id} by {user_id}")
+                    
+                    # Set referrer for new user
+                    await update_user(user_id, referrer_id=referrer_id)
         
         # Notify admin only for new users
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}\n📊 کاربران کل: {(await get_bot_stats())['total_users']:,}"
+                text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}"
             )
             logger.info(f"📢 Admin notified of new user {user_id}")
         except Exception as e:
             logger.error(f"❌ Error notifying admin: {e}")
-    else:
-        # Handle referral for existing users who came via referral link but weren't referred before
-        if referrer_id and referrer_id != user_id and not user.get('referrer_id'):
-            await handle_referral(user_id, referrer_id, context)
     
     # Refresh free guess always
     await refresh_free_guess(user_id)
@@ -403,17 +354,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Error setting commands: {e}")
     
     # Welcome message
-    welcome_text = "🎮 به ربات حدس کَش خوش آمدید! ✨\n\n" \
-                  "🎲 با حدس عدد درست (۱ تا ۱۰۰۰) می‌توانید درآمد کسب کنید! 💰\n\n" \
-                  "🆓 هر هفته یک فرصت رایگان دارید!\n" \
-                  "👥 با دعوت دوستان موجودی خود را افزایش دهید!\n" \
-                  "💳 با افزایش موجودی هم می‌توانید بازی کنید!"
-    
-    if was_new and referrer_id and referrer_id != user_id:
-        welcome_text += f"\n\n🎁 شما با لینک دعوت کاربر دیگر عضو شدید!"
-    
     await update.message.reply_text(
-        welcome_text,
+        "🎮 به ربات حدس کَش خوش آمدید! ✨\n\n"
+        "🎲 با حدس عدد درست (۱ تا ۱۰۰۰) می‌توانید درآمد کسب کنید! 💰\n\n"
+        "🆓 هر هفته یک فرصت رایگان دارید!\n"
+        "👥 با دعوت دوستان موجودی خود را افزایش دهید!\n"
+        "💳 با افزایش موجودی هم می‌توانید بازی کنید!",
         reply_markup=get_main_menu()
     )
     logger.info(f"👋 Welcome message sent to user {user_id}")
@@ -430,9 +376,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 آمار کامل ربات:\n\n"
         f"👥 تعداد کل کاربران: {stats_data['total_users']:,}\n"
+        f"🆕 کاربران جدید (24h): {stats_data['new_users']:,}\n"
         f"🟢 کاربران فعال (24h): {stats_data['active_users']:,}\n"
-        f"🆕 کاربران جدید امروز: {stats_data['new_users_today']:,}\n"
-        f"📈 کاربران جدید این هفته: {stats_data['new_users_week']:,}\n"
         f"💰 درآمد کل ربات: {stats_data['total_income']:,} تومان\n"
         f"👥 تعداد کاربران دعوت شده: {stats_data['total_referred']:,}\n"
         f"🔘 وضعیت ربات: {'🟢 روشن' if bot_enabled else '🔴 خاموش'}"
@@ -914,24 +859,15 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 next_free_guess = "امروز"
         
-        profile_text = f"👤 پروفایل شما:\n\n" \
-                      f"🆔 ID: {user_id}\n" \
-                      f"📛 نام کاربری: @{user.get('username', 'Unknown')}\n" \
-                      f"💰 موجودی: {user.get('balance', 0):,} تومان\n" \
-                      f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n" \
-                      f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n" \
-                      f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n" \
-                      f"💸 کل هزینه: {user.get('total_spent', 0):,} تومان\n" \
-                      f"🆓 فرصت رایگان بعدی: {next_free_guess}"
-        
-        # Add referrer info if exists
-        if user.get('referrer_id'):
-            referrer = await get_user(user['referrer_id'])
-            if referrer:
-                profile_text += f"\n👤 دعوت شده توسط: @{referrer.get('username', 'Unknown')}"
-        
         await update.message.reply_text(
-            profile_text,
+            f"👤 پروفایل شما:\n\n"
+            f"🆔 ID: {user_id}\n"
+            f"📛 نام کاربری: @{user.get('username', 'Unknown')}\n"
+            f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
+            f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
+            f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
+            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
+            f"🆓 فرصت رایگان بعدی: {next_free_guess}",
             reply_markup=get_main_menu()
         )
         logger.info(f"📊 Profile shown for {user_id}")
@@ -949,8 +885,7 @@ async def invite_friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 لینک دعوت شما:\n{referral_link}\n\n"
         f"📢 ربات حدس کَش:\n"
         f"🎲 با حدس عدد درست درآمد کسب کنید!\n"
-        f"🆓 هر هفته یک فرصت رایگان!\n"
-        f"💰 جایزه: ۱,۰۰۰,۰۰۰ تومان!",
+        f"🆓 هر هفته یک فرصت رایگان!",
         reply_markup=get_main_menu()
     )
     logger.info(f"📤 Invite link sent to {user_id}")

@@ -325,6 +325,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"❌ Error notifying admin: {e}")
     
+    # Refresh free guess always
+    await refresh_free_guess(user_id)
+    
     # Set menu commands based on user
     scope = BotCommandScopeChat(chat_id=user_id)
     if user_id == ADMIN_ID:
@@ -498,12 +501,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle payment approval
     if data.startswith("approve_"):
         if user_id != ADMIN_ID:
-            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            await query.edit_message_caption(caption="❌ شما دسترسی لازم را ندارید!")
             return
             
         parts = data.split("_")
         if len(parts) != 3:
-            await query.edit_message_text("❌ داده نامعتبر!")
+            await query.edit_message_caption(caption="❌ داده نامعتبر!")
             return
             
         payment_user_id = int(parts[1])
@@ -515,8 +518,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_total_deposited = user.get("total_deposited", 0) + amount
             await update_user(payment_user_id, balance=new_balance, total_deposited=new_total_deposited)
             
-            await query.edit_message_text(
-                f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
+            await query.edit_message_caption(
+                caption=f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
                 f"💰 مبلغ: {amount:,} تومان\n"
                 f"💸 موجودی جدید: {new_balance:,} تومان"
             )
@@ -532,24 +535,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"❌ Error notifying user of payment approval: {e}")
                 
         else:
-            await query.edit_message_text("❌ کاربر یافت نشد!")
+            await query.edit_message_caption(caption="❌ کاربر یافت نشد!")
     
     # Handle payment rejection
     elif data.startswith("reject_"):
         if user_id != ADMIN_ID:
-            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            await query.edit_message_caption(caption="❌ شما دسترسی لازم را ندارید!")
             return
             
         parts = data.split("_")
         if len(parts) != 2:
-            await query.edit_message_text("❌ داده نامعتبر!")
+            await query.edit_message_caption(caption="❌ داده نامعتبر!")
             return
             
         payment_user_id = int(parts[1])
         
         user = await get_user(payment_user_id)
-        await query.edit_message_text(
-            f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
+        await query.edit_message_caption(
+            caption=f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
         )
         
         # Notify user

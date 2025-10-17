@@ -92,8 +92,8 @@ async def create_user(user_id: int, username: str):
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-                user_id, username
+                "INSERT INTO users (user_id, username, balance, guesses_left) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id) DO NOTHING",
+                user_id, username, 0, 1
             )
             logger.info(f"✅ New user created: {user_id}")
     except Exception as e:
@@ -223,7 +223,7 @@ async def get_tron_price():
                 return data["tron"]["irr"]
     except Exception as e:
         logger.error(f"❌ Error fetching TRON price: {e}")
-        return 6720  # Fallback price in IRR (approx 0.16 USD * 42000 IRR/USD)
+        return 96000  # Updated fallback price in IRR (approx current value)
 
 # Convert Toman to TRON with fee consideration
 async def toman_to_tron(toman):
@@ -324,7 +324,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         commands = [
             ("start", "شروع بازی")
         ]
-    await context.bot.set_my_commands(commands, scope=scope)
+    try:
+        await context.bot.set_my_commands(commands, scope=scope)
+    except Exception as e:
+        logger.error(f"❌ Error setting commands: {e}")
     
     # Welcome message
     await update.message.reply_text(
@@ -477,6 +480,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle payment approval
     if data.startswith("approve_"):
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            return
+            
         payment_user_id = int(data.split("_")[1])
         amount = int(data.split("_")[2])
         
@@ -486,8 +493,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_total_deposited = user.get("total_deposited", 0) + amount
             await update_user(payment_user_id, balance=new_balance, total_deposited=new_total_deposited)
             
-            await query.edit_message_caption(
-                caption=f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
+            await query.edit_message_text(
+                f"✅ پرداخت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
                 f"💰 مبلغ: {amount:,} تومان\n"
                 f"💸 موجودی جدید: {new_balance:,} تومان"
             )
@@ -503,15 +510,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"❌ Error notifying user of payment approval: {e}")
                 
         else:
-            await query.edit_message_caption(caption="❌ کاربر یافت نشد!")
+            await query.edit_message_text("❌ کاربر یافت نشد!")
     
     # Handle payment rejection
     elif data.startswith("reject_"):
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            return
+            
         payment_user_id = int(data.split("_")[1])
         
         user = await get_user(payment_user_id)
-        await query.edit_message_caption(
-            caption=f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
+        await query.edit_message_text(
+            f"❌ پرداخت کاربر @{user.get('username', 'Unknown')} رد شد!"
         )
         
         # Notify user
@@ -526,6 +537,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle database clear confirmation
     elif data == "clear_confirm":
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            return
+            
         if await clear_database():
             await query.edit_message_text("✅ دیتابیس با موفقیت پاک شد!")
         else:
@@ -536,16 +551,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle bot toggle
     elif data == "toggle_on":
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            return
+            
         global bot_enabled
         bot_enabled = True
         await query.edit_message_text("✅ ربات روشن شد!")
     
     elif data == "toggle_off":
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            return
+            
         bot_enabled = False
         await query.edit_message_text("🔴 ربات خاموش شد!")
     
     # Handle broadcast confirmation
     elif data == "broadcast_confirm":
+        if user_id != ADMIN_ID:
+            await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
+            return
+            
         broadcast_message = context.user_data.get("broadcast_message")
         if broadcast_message:
             all_users = await get_all_users()
@@ -658,9 +685,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state == "increase_balance":
         await handle_balance_increase(update, context)
         return
-
-    # Default response for unknown text
-    await update.message.reply_text("لطفاً از گزینه‌های منو استفاده کنید.", reply_markup=get_main_menu())
+        
+    # Default response for unknown messages
+    await update.message.reply_text(
+        "⚠️ لطفاً از منوی اصلی استفاده کنید:",
+        reply_markup=get_main_menu()
+    )
 
 # Start game handler
 async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,15 +703,21 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Check if user has free guess this week
     now = datetime.now()
-    last_guess = user.get("last_free_guess", now - timedelta(days=8))
-    
-    if (now - last_guess).days >= 7:
+    last_guess = user.get("last_free_guess")
+    if last_guess:
+        last_guess = last_guess.replace(tzinfo=None) if last_guess.tzinfo else last_guess
+        if (now - last_guess).days >= 7:
+            await update_user(user_id, guesses_left=1, last_free_guess=now)
+            user["guesses_left"] = 1
+            logger.info(f"🆓 Free guess reset for {user_id}")
+    else:
+        # If no last_free_guess, set it to now and give free guess
         await update_user(user_id, guesses_left=1, last_free_guess=now)
         user["guesses_left"] = 1
-        logger.info(f"🆓 Free guess reset for {user_id}")
+        logger.info(f"🆓 Initial free guess set for {user_id}")
 
     # Check if user can guess
-    if user["guesses_left"] == 0 and user["balance"] < MIN_BALANCE_FOR_GUESS:
+    if user.get("guesses_left", 0) == 0 and user.get("balance", 0) < MIN_BALANCE_FOR_GUESS:
         await update.message.reply_text(
             "❌ شانس شما تمام شده است! 💔\n\n"
             "برای ادامه بازی:\n"
@@ -726,7 +762,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winning_number = get_winning_number(user_id)
             
         # Use free guess or deduct balance
-        if user["guesses_left"] > 0:
+        if user.get("guesses_left", 0) > 0:
             await update_user(user_id, guesses_left=user["guesses_left"] - 1)
             logger.info(f"🆓 Used free guess for {user_id}")
         else:
@@ -738,7 +774,7 @@ async def handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check if guess is correct
         if guess == winning_number:
             new_balance = user["balance"] + PRIZE_AMOUNT
-            new_total_earned = user["total_earned"] + PRIZE_AMOUNT
+            new_total_earned = user.get("total_earned", 0) + PRIZE_AMOUNT
             await update_user(user_id, balance=new_balance, total_earned=new_total_earned)
             
             await update.message.reply_text(
@@ -787,6 +823,20 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await get_user(user_id)
     
     if user:
+        # Check if user has free guess this week
+        now = datetime.now()
+        last_guess = user.get("last_free_guess")
+        next_free_guess = "امروز"
+        
+        if last_guess:
+            last_guess = last_guess.replace(tzinfo=None) if last_guess.tzinfo else last_guess
+            days_passed = (now - last_guess).days
+            days_remaining = 7 - days_passed
+            if days_remaining > 0:
+                next_free_guess = f"{days_remaining} روز دیگر"
+            else:
+                next_free_guess = "امروز"
+        
         await update.message.reply_text(
             f"👤 پروفایل شما:\n\n"
             f"🆔 ID: {user_id}\n"
@@ -794,7 +844,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 موجودی: {user.get('balance', 0):,} تومان\n"
             f"🎯 شانس باقی‌مانده: {user.get('guesses_left', 0)}\n"
             f"👥 تعداد دعوت‌ها: {user.get('referrals', 0)}\n"
-            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان",
+            f"💵 کل درآمد: {user.get('total_earned', 0):,} تومان\n"
+            f"🆓 فرصت رایگان بعدی: {next_free_guess}",
             reply_markup=get_main_menu()
         )
         logger.info(f"📊 Profile shown for {user_id}")

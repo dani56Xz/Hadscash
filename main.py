@@ -234,6 +234,15 @@ async def toman_to_tron(toman):
 def generate_winning_number():
     return random.randint(1, 1000)
 
+# تابع برای بررسی وضعیت بات
+def is_bot_active():
+    return BOT_ACTIVE
+
+# تابع برای تغییر وضعیت بات
+def set_bot_active(status: bool):
+    global BOT_ACTIVE
+    BOT_ACTIVE = status
+
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -244,7 +253,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_user(user_id, last_active=datetime.now())
     
     # Check if bot is active for regular users
-    if user_id != ADMIN_ID and not BOT_ACTIVE:
+    if user_id != ADMIN_ID and not is_bot_active():
         await update.message.reply_text("⏸️ ربات در حال حاضر غیرفعال است. لطفاً稍后 تلاش کنید.")
         return
     
@@ -327,7 +336,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 تعداد کل کاربران: {total_users:,}\n"
             f"🟢 کاربران فعال (24h): {active_users:,}\n"
             f"💰 درآمد کل ربات: {total_income:,} تومان\n"
-            f"🔌 وضعیت بات: {'فعال' if BOT_ACTIVE else 'غیرفعال'}"
+            f"🔌 وضعیت بات: {'فعال' if is_bot_active() else 'غیرفعال'}"
         )
         
         await update.message.reply_text(stats_text, reply_markup=get_admin_menu())
@@ -528,7 +537,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_user(user_id, last_active=datetime.now())
     
     # Check if bot is active for regular users
-    if user_id != ADMIN_ID and not BOT_ACTIVE:
+    if user_id != ADMIN_ID and not is_bot_active():
         await update.message.reply_text("⏸️ ربات در حال حاضر غیرفعال است. لطفاً稍后 تلاش کنید.")
         return
     
@@ -565,15 +574,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await manage_bot(update, context)
             return
         elif text == "✅ روشن کردن بات":
-            # استفاده از global برای تغییر متغیر
-            global BOT_ACTIVE
-            BOT_ACTIVE = True
+            set_bot_active(True)
             await update.message.reply_text("✅ ربات روشن شد!", reply_markup=get_admin_menu())
             return
         elif text == "❌ خاموش کردن بات":
-            # استفاده از global برای تغییر متغیر
-            global BOT_ACTIVE
-            BOT_ACTIVE = False
+            set_bot_active(False)
             await update.message.reply_text("❌ ربات خاموش شد!", reply_markup=get_admin_menu())
             return
         elif text == "❌ لغو" and context.user_data.get("broadcasting"):

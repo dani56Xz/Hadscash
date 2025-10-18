@@ -29,6 +29,7 @@ DATABASE_URL = "postgresql://neondb_owner:npg_sAQj9gCK3wly@ep-winter-cherry-aezv
 # Global variables
 bot_enabled = True
 user_winning_numbers = {}
+new_users_tracker = set()  # Track new users to avoid duplicate notifications
 
 # Logging setup
 logging.basicConfig(
@@ -67,10 +68,10 @@ async def init_db():
                     total_earned INTEGER DEFAULT 0,
                     total_spent INTEGER DEFAULT 0,
                     total_deposited INTEGER DEFAULT 0,
+                    total_withdrawn INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT NOW(),
                     last_active TIMESTAMP DEFAULT NOW(),
-                    is_active BOOLEAN DEFAULT true,
-                    is_new_user BOOLEAN DEFAULT true
+                    is_active BOOLEAN DEFAULT true
                 )
             ''')
             logger.info("✅ Users table created/verified")
@@ -93,11 +94,18 @@ async def create_user(user_id: int, username: str, referrer_id: int = None):
     """Create new user in database"""
     try:
         async with db_pool.acquire() as conn:
+            # Set initial guesses based on referral
+            initial_guesses = 2 if referrer_id else 1
+            
             await conn.execute(
-                "INSERT INTO users (user_id, username, referrer_id, balance, guesses_left, is_new_user) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (user_id) DO NOTHING",
-                user_id, username, referrer_id, 0, 1, True
+                "INSERT INTO users (user_id, username, referrer_id, balance, guesses_left) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id) DO NOTHING",
+                user_id, username, referrer_id, 0, initial_guesses
             )
-            logger.info(f"✅ New user created: {user_id} with referrer: {referrer_id}")
+            logger.info(f"✅ New user created: {user_id} with referrer: {referrer_id}, guesses: {initial_guesses}")
+            
+            # Track as new user for notification
+            new_users_tracker.add(user_id)
+            
             return True
     except Exception as e:
         logger.error(f"❌ Error creating user {user_id}: {e}")
@@ -122,7 +130,7 @@ async def update_user_activity(user_id: int):
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "UPDATE users SET last_active = NOW(), is_new_user = false WHERE user_id = $1",
+                "UPDATE users SET last_active = NOW() WHERE user_id = $1",
                 user_id
             )
     except Exception as e:
@@ -156,13 +164,17 @@ async def get_bot_stats():
                 "SELECT COUNT(*) FROM users WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'"
             )
             
+            # Total withdrawals
+            total_withdrawals = await conn.fetchval("SELECT COALESCE(SUM(total_withdrawn), 0) FROM users")
+            
             return {
                 "total_users": total_users,
                 "active_users": active_users,
                 "total_income": total_income,
                 "total_referred": total_referred,
                 "new_users_today": new_users_today,
-                "new_users_week": new_users_week
+                "new_users_week": new_users_week,
+                "total_withdrawals": total_withdrawals
             }
     except Exception as e:
         logger.error(f"❌ Error getting bot stats: {e}")
@@ -172,7 +184,8 @@ async def get_bot_stats():
             "total_income": 0, 
             "total_referred": 0,
             "new_users_today": 0,
-            "new_users_week": 0
+            "new_users_week": 0,
+            "total_withdrawals": 0
         }
 
 async def get_all_users():
@@ -236,27 +249,39 @@ async def check_membership(bot, user_id):
         logger.error(f"❌ Error checking membership for user {user_id}: {e}")
         return False
 
-# Fetch TRON price in Toman from ArzDigital
+# Fetch TRON price in IRR from multiple sources
 async def get_tron_price():
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Using ArzDigital API for TRON price in Toman
-            async with session.get("https://api.arz.digital/v1/tron", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-                logger.info(f"💰 TRON price fetched from ArzDigital: {data}")
-                if data.get("success") and data.get("data"):
-                    # Price is in Toman directly
-                    return float(data["data"]["price"])
-                else:
-                    raise Exception("Invalid response from ArzDigital")
-    except Exception as e:
-        logger.error(f"❌ Error fetching TRON price from ArzDigital: {e}")
-        # Fallback to approximate price
-        return 14.5  # Approximate TRX price in Toman
+    sources = [
+        "https://api.coingecko.com/api/v3/simple/price?ids=tron&vs_currencies=irr",
+        "https://api.arz.digital/v1/ticker/trx"
+    ]
+    
+    for source in sources:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(source, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    data = await resp.json()
+                    logger.info(f"💰 TRON price fetched from {source}: {data}")
+                    
+                    if "tron" in data and "irr" in data["tron"]:
+                        return data["tron"]["irr"]
+                    elif "data" in data and "price" in data["data"]:
+                        # Convert to IRR (1 Toman = 10 IRR)
+                        price_toman = float(data["data"]["price"])
+                        return price_toman * 10
+                        
+        except Exception as e:
+            logger.error(f"❌ Error fetching TRON price from {source}: {e}")
+            continue
+    
+    # Fallback price
+    logger.warning("⚠️ Using fallback TRON price")
+    return 96000  # Fallback price in IRR
 
-# Convert Toman to TRON
+# Convert Toman to TRON with fee consideration
 async def toman_to_tron(toman):
-    tron_price_toman = await get_tron_price()
+    tron_price_irr = await get_tron_price()
+    tron_price_toman = tron_price_irr / 10  # 1 Toman = 10 IRR
     tron_amount = toman / tron_price_toman
     return tron_amount
 
@@ -291,7 +316,7 @@ async def refresh_free_guess(user_id: int):
         logger.info(f"🆓 Free guess reset for {user_id}")
 
 async def handle_referral(user_id: int, referrer_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Handle referral bonus for referrer and extra guess for referred user"""
+    """Handle referral bonus for referrer"""
     try:
         referrer = await get_user(referrer_id)
         if referrer:
@@ -299,12 +324,6 @@ async def handle_referral(user_id: int, referrer_id: int, context: ContextTypes.
             new_balance = referrer["balance"] + REFERRAL_BONUS
             new_referrals = referrer["referrals"] + 1
             await update_user(referrer_id, balance=new_balance, referrals=new_referrals)
-            
-            # Give extra guess to referred user
-            referred_user = await get_user(user_id)
-            if referred_user:
-                new_guesses = referred_user["guesses_left"] + 1
-                await update_user(user_id, guesses_left=new_guesses)
             
             # Notify referrer
             await context.bot.send_message(
@@ -374,17 +393,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if referrer_id:
             await handle_referral(user_id, referrer_id, context)
         
-        # Notify admin only for new users (first time)
-        try:
-            if was_new:
+        # Notify admin only for truly new users
+        if user_id in new_users_tracker:
+            try:
                 referral_text = f" (دعوت شده توسط {referrer_id})" if referrer_id else ""
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=f"🎉 کاربر جدید:\n👤 ID: {user_id}\n📛 @{username}{referral_text}"
                 )
                 logger.info(f"📢 Admin notified of new user {user_id}")
-        except Exception as e:
-            logger.error(f"❌ Error notifying admin: {e}")
+                new_users_tracker.remove(user_id)  # Remove from tracker after notification
+            except Exception as e:
+                logger.error(f"❌ Error notifying admin: {e}")
     
     # Refresh free guess always
     await refresh_free_guess(user_id)
@@ -419,7 +439,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💳 با افزایش موجودی هم می‌توانید بازی کنید!"
     )
     
-    if was_new and user.get('referrer_id'):
+    if was_new and user and user.get('referrer_id'):
         welcome_text += f"\n\n🎁 شما با دعوت یکی از دوستان عضو شدید و ۲ فرصت حدس دارید!"
     
     await update.message.reply_text(
@@ -442,6 +462,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 تعداد کل کاربران: {stats_data['total_users']:,}\n"
         f"🟢 کاربران فعال (24h): {stats_data['active_users']:,}\n"
         f"💰 درآمد کل ربات: {stats_data['total_income']:,} تومان\n"
+        f"💸 مجموع برداشت‌ها: {stats_data['total_withdrawals']:,} تومان\n"
         f"👥 تعداد کاربران دعوت شده: {stats_data['total_referred']:,}\n"
         f"📈 کاربران جدید امروز: {stats_data['new_users_today']:,}\n"
         f"📅 کاربران جدید این هفته: {stats_data['new_users_week']:,}\n"
@@ -519,6 +540,7 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👥 دعوت‌ها: {user.get('referrals', 0)}\n"
                 f"💵 درآمد: {user.get('total_earned', 0):,} تومان\n"
                 f"💸 هزینه: {user.get('total_spent', 0):,} تومان\n"
+                f"🏧 برداشت: {user.get('total_withdrawn', 0):,} تومان\n"
                 f"🕒 عضویت: {user.get('created_at').strftime('%Y-%m-%d %H:%M')}\n"
                 f"🟢 آخرین فعالیت: {user.get('last_active').strftime('%Y-%m-%d %H:%M')}\n"
                 f"{'-' * 30}\n"
@@ -637,25 +659,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"❌ Error notifying user of payment rejection: {e}")
     
     # Handle withdrawal confirmation
-    elif data.startswith("withdraw_approve_"):
+    elif data.startswith("withdraw_"):
         if user_id != ADMIN_ID:
             await query.edit_message_text("❌ شما دسترسی لازم را ندارید!")
             return
             
         parts = data.split("_")
-        if len(parts) != 4:
+        if len(parts) != 3:
             await query.edit_message_text("❌ داده نامعتبر!")
             return
             
-        withdraw_user_id = int(parts[2])
-        amount = int(parts[3])
+        withdraw_user_id = int(parts[1])
+        amount = int(parts[2])
         
         user = await get_user(withdraw_user_id)
         if user:
             await query.edit_message_text(
                 f"✅ برداشت کاربر @{user.get('username', 'Unknown')} تأیید شد!\n"
                 f"💰 مبلغ: {amount:,} تومان\n"
-                f"💳 به شماره کارت ارسالی واریز شد."
+                f"💳 شماره کارت: {context.user_data.get('card_number', 'نامشخص')}"
             )
             
             # Notify user
@@ -666,7 +688,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=get_main_menu()
                 )
             except Exception as e:
-                logger.error(f"❌ Error notifying user of withdrawal approval: {e}")
+                logger.error(f"❌ Error notifying user of withdrawal: {e}")
         else:
             await query.edit_message_text("❌ کاربر یافت نشد!")
     
@@ -1058,7 +1080,7 @@ async def handle_balance_increase(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(
             f"💳 درخواست افزایش موجودی\n\n"
             f"💰 مبلغ: {amount:,} تومان\n"
-            f"🔢 مقدار TRX مورد نیاز: {tron_amount:.4f}\n\n"
+            f"🔢 مقدار TRX مورد نیاز: {tron_amount:.6f}\n\n"
             f"🏦 آدرس TRON:\n`{TRON_ADDRESS}`\n\n"
             f"📸 لطفاً پس از واریز، اسکرین شات پرداخت را ارسال کنید.\n"
             f"✅ ادمین پس از تأیید، موجودی شما را افزایش می‌دهد.",
@@ -1070,7 +1092,7 @@ async def handle_balance_increase(update: Update, context: ContextTypes.DEFAULT_
         context.user_data["amount"] = amount
         context.user_data["tron_amount"] = tron_amount
         
-        logger.info(f"💳 Deposit request by {user_id}: {amount} Toman ({tron_amount} TRX)")
+        logger.info(f"💳 Deposit request by {user_id}: {amount} Toman ({tron_amount:.6f} TRX)")
         
     except ValueError:
         await update.message.reply_text("⚠️ لطفاً یک عدد معتبر وارد کنید! 🔢")
@@ -1089,7 +1111,8 @@ async def withdraw_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ موجودی شما برای برداشت کافی نیست!\n\n"
             f"💰 موجودی فعلی: {user.get('balance', 0):,} تومان\n"
-            f"💳 حداقل برداشت: {MIN_WITHDRAWAL:,} تومان",
+            f"💳 حداقل برداشت: {MIN_WITHDRAWAL:,} تومان\n\n"
+            f"💸 برای برداشت باید حداقل {MIN_WITHDRAWAL:,} تومان موجودی داشته باشید.",
             reply_markup=get_balance_menu()
         )
         return
@@ -1111,18 +1134,23 @@ async def handle_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_T
     
     try:
         amount = int(text)
+        balance = user.get("balance", 0)
+        
         if amount < MIN_WITHDRAWAL:
             await update.message.reply_text(f"⚠️ حداقل مبلغ برداشت {MIN_WITHDRAWAL:,} تومان است!")
             return
-        
-        if amount > user.get("balance", 0):
-            await update.message.reply_text("⚠️ موجودی شما کافی نیست!")
+            
+        if amount > balance:
+            await update.message.reply_text(f"⚠️ موجودی شما کافی نیست! موجودی فعلی: {balance:,} تومان")
             return
         
         context.user_data["withdraw_amount"] = amount
         
         await update.message.reply_text(
-            f"💳 لطفاً شماره کارت ۱۶ رقمی خود را وارد کنید:",
+            f"💳 لطفاً شماره کارت خود را وارد کنید:\n\n"
+            f"💰 مبلغ برداشت: {amount:,} تومان\n"
+            f"💸 موجودی پس از برداشت: {balance - amount:,} تومان\n\n"
+            f"📞 شماره کارت باید ۱۶ رقمی باشد.",
             reply_markup=ReplyKeyboardMarkup([["🔙 بازگشت به منو"]], resize_keyboard=True)
         )
         context.user_data["state"] = "withdraw_card"
@@ -1137,22 +1165,21 @@ async def handle_withdraw_card(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # Validate card number (16 digits)
     if not (text.isdigit() and len(text) == 16):
-        await update.message.reply_text("⚠️ لطفاً یک شماره کارت ۱۶ رقمی معتبر وارد کنید!")
+        await update.message.reply_text("⚠️ شماره کارت باید ۱۶ رقم باشد! لطفاً دوباره وارد کنید:")
         return
     
     context.user_data["card_number"] = text
-    
     amount = context.user_data["withdraw_amount"]
     
     keyboard = [
-        ["✅ بله، برداشت کن", "❌ خیر، انصراف"]
+        ["✅ بله، برداشت کن", "❌ لغو"]
     ]
     
     await update.message.reply_text(
         f"🏧 تأیید برداشت\n\n"
         f"💰 مبلغ: {amount:,} تومان\n"
         f"💳 شماره کارت: {text}\n\n"
-        f"آیا از برداشت این مبلغ اطمینان دارید؟",
+        f"⚠️ آیا از برداشت این مبلغ اطمینان دارید؟",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
     context.user_data["state"] = "withdraw_confirm"
@@ -1169,11 +1196,12 @@ async def handle_withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_
         
         # Deduct balance immediately
         new_balance = user["balance"] - amount
-        await update_user(user_id, balance=new_balance)
+        new_total_withdrawn = user.get("total_withdrawn", 0) + amount
+        await update_user(user_id, balance=new_balance, total_withdrawn=new_total_withdrawn)
         
         # Notify admin
         keyboard = [
-            [InlineKeyboardButton("✅ واریز شد", callback_data=f"withdraw_approve_{user_id}_{amount}")]
+            [InlineKeyboardButton("✅ واریز شد", callback_data=f"withdraw_{user_id}_{amount}")]
         ]
         
         try:
@@ -1193,12 +1221,13 @@ async def handle_withdraw_confirm(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(
             f"✅ درخواست برداشت شما ثبت شد!\n\n"
             f"💰 مبلغ: {amount:,} تومان\n"
-            f"💳 شماره کارت: {card_number}\n\n"
+            f"💳 شماره کارت: {card_number}\n"
+            f"💸 موجودی جدید: {new_balance:,} تومان\n\n"
             f"⏳ لطفاً منتظر واریز به حساب باشید.",
             reply_markup=get_main_menu()
         )
         
-        logger.info(f"🏧 Withdrawal request by {user_id}: {amount} to card {card_number}")
+        logger.info(f"🏧 Withdrawal request by {user_id}: {amount} Toman to card {card_number}")
         
     else:
         await update.message.reply_text("❌ برداشت لغو شد.", reply_markup=get_main_menu())
@@ -1232,7 +1261,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        f"👤 کاربر: @{user.get('username', 'Unknown')}\n"
                        f"🆔 ID: {user_id}\n"
                        f"💰 مبلغ: {amount:,} تومان\n"
-                       f"🔢 TRX: {tron_amount:.4f}",
+                       f"🔢 TRX: {tron_amount:.6f}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
@@ -1265,12 +1294,12 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 افزایش موجودی:\n"
         "• دعوت دوستان (هر نفر ۵,۰۰۰ تومان)\n"
         "• واریز ترون (حداقل ۲۰،۰۰۰ تومان)\n\n"
-        "👥 دعوت دوستان:\n"
-        f"• به ازای هر دعوت: 5,000 تومان\n"
-        "• دوستان شما هم یک فرصت رایگان اضافی می‌گیرند\n\n"
         "🏧 برداشت:\n"
         f"• حداقل برداشت: {MIN_WITHDRAWAL:,} تومان\n"
-        "• واریز به شماره کارت شبا\n\n"
+        "• پس از ثبت درخواست، ادمین واریز می‌کند\n\n"
+        "👥 دعوت دوستان:\n"
+        f"• به ازای هر دعوت: 5,000 تومان\n"
+        "• دوستان شما هم ۲ فرصت حدس می‌گیرند\n\n"
         "❓ سوالات متداول:\n"
         "• هر کاربر هفته‌ای یک بار بصورت رایگان می‌تواند بازی کند\n"
         "• حداقل موجودی برای بازی: ۲۰,۰۰۰ تومان\n"
